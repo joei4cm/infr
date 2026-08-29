@@ -39,6 +39,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   V4 context length. Metal is parity-tested too: its kernel is `#[ignore]`d
   locally for want of Apple hardware, but the macOS CI job runs the ignored
   tests, so `compress_pool_f32` compiled and matched CPU on a real device.
+- **`Op::Attention` gained an optional `key_bias` — an additive per-(query row,
+  key) score mask, on CPU, Vulkan and Metal.** Ordinary attention could not
+  previously carry the top-k mask `Op::TopkMask` produces; only `Op::Mla` had a
+  `key_bias` field, and DeepSeek V4's CSA (compressed/selective attention)
+  layers need the same mask on plain attention instead. The new field is the
+  identical contract MLA's `key_bias` already has — added to the scaled score
+  `q·K[j]*scale` BEFORE the softmax max, indexed by key POSITION (never the
+  ring-cache row), `-inf` at unselected keys — and combines independently with
+  `sinks` on the same op, since a V4 CSA layer carries both at once. Landed in
+  the SAME kernel family sinks already uses on every backend (Vulkan's
+  `attention_kv.comp` `-DBIAS`/`-DSINKS -DBIAS` builds, Metal's
+  `ATTN_BIAS_KERNEL`/`ATTN_SINKS_BIAS_KERNEL` macros, one CPU interpreter arm)
+  rather than a second kernel, so a layer using both never has one field
+  silently dropped by whichever kernel happens to run. `key_bias: None` is
+  byte-identical to before this field existed on every model in the tree. Note
+  for anyone porting the op to a fourth backend: a `-inf` on the FIRST key of a
+  row is the case that separates the three softmax formulations — a running max
+  seeded at `-inf` evaluates `exp(-inf - -inf)` and NaNs the whole row, which
+  the Metal kernels guard explicitly and the CPU (separate max pass) and Vulkan
+  (finite tile-max seed) arms cannot reach. Not yet wired into the DeepSeek V4
+  model builder — see `docs/backlog.md`.
 - **DeepSeek V4's hash-routed MoE layers run, on CPU and Vulkan.** Such a layer
   takes its experts from an i32 `blk.N.ffn_gate_tid2eid`
   `[n_expert_used, n_vocab]` table indexed by TOKEN ID rather than from the

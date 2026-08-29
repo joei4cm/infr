@@ -1455,10 +1455,18 @@ change.
     revisit this**, since `split_equal` does produce a real per-sequence token
     count — that is the point at which `n_seq_tokens` has to become a parameter
     rather than a constant.
-- **`Op::Attention` has no `key_bias` field.** `Op::TopkMask` exists and
-  `Op::Mla` consumes it, but the CSA path needs a top-k mask on ordinary
-  attention over a concatenated `[raw | compressed]` K, which has nowhere to go
-  today.
+- **`Op::Attention::key_bias` landed on CPU/Vulkan/Metal (2026-08-30), but
+  nothing calls it for CSA yet.** The op-level capability is done and
+  parity-tested (`crates/infr-llama/tests/seam_op_parity.rs`'s
+  `attention_key_bias_*` tests, `crates/infr-metal/tests/parity.rs`'s
+  `attention_key_bias_*_parity` `#[ignore]`d tests) — same kernel family as
+  `sinks` on every backend, combinable with it. What is still missing is the CSA
+  graph itself: a builder in `runner.rs` that concatenates `[raw | compressed]`
+  K/V, runs `Op::TopkMask` over it, and passes the result as `key_bias` on an
+  ordinary `Op::Attention` alongside `mw.sinks` — none of which exists yet
+  (deepseek4's only real `Op::Attention` sinks call site in `runner.rs` still
+  passes `key_bias: None`). Needs the `[raw | compressed]` concatenation layout
+  decided first, which is part of Slice B above.
 - **`Op::LightningIndexer`'s contract is written for V3.2's per-token key
   cache.** V4's keys come out of the compressor, so `top_k` counts compressed
   blocks; re-read the op's `k_cache`/`kv_len` meaning before reusing it.

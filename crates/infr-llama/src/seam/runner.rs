@@ -2978,6 +2978,9 @@ pub(crate) fn generate_dense_backend(
                     mask,
                     pos: start_pos as u32,
                     sinks: Some(mw.sinks),
+                    // CSA's top-k score bias is not wired into this builder yet (see
+                    // `docs/backlog.md`) — landed but unwired, same as `Op::CompressPool` was.
+                    key_bias: None,
                 });
                 // DE-ROPE the attention output's rope slice, per head, by the QUERY position —
                 // `ggml_rope_ext_back` at the same theta and layout as the forward q rope. Nothing
@@ -3742,6 +3745,7 @@ pub(crate) fn generate_dense_backend(
                     mask,
                     pos: start_pos as u32,
                     sinks: None,
+                    key_bias: None,
                 });
                 // qwen35: per-head SIGMOID output gate applied to the attention output BEFORE the
                 // o-projection (`gate_a` was split out of the interleaved `attn_q` projection above).

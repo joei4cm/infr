@@ -402,6 +402,7 @@ fn qknormrope_attn_chain() {
         mask: AttnMask::Causal,
         pos: 0,
         sinks: None,
+        key_bias: None,
     });
     let xi = gen(rows * nh * hd, 4);
     let wi = gen(hd, 5).iter().map(|v| v + 1.0).collect::<Vec<_>>();
@@ -524,6 +525,7 @@ fn qwen35_attn_core_writekv() {
         mask: AttnMask::Causal,
         pos: 0,
         sinks: None,
+        key_bias: None,
     });
     let qi = gen(rows * nh * hd, 4);
     let ki = gen(rows * nkv * hd, 8);
@@ -2768,6 +2770,7 @@ fn attention_sinks_are_denominator_only() {
             mask: AttnMask::Causal,
             pos: 0,
             sinks: with_sinks.then_some(sk),
+            key_bias: None,
         });
         (g, q, kc, vc, sk, dst)
     };
@@ -2857,6 +2860,667 @@ fn attention_sinks_are_denominator_only() {
         assert!(
             e < 1e-4,
             "{name}: a sink 18 below the max changed the output: max_err={e:e}"
+        );
+    };
+    check(&cpu, "cpu");
+    if let Some(vk) = gpu() {
+        check(&vk, "vulkan");
+    }
+}
+
+// ── Op::Attention's optional key_bias (DeepSeek V4 CSA's top-k score mask) ────────────────────
+
+/// Hand-written softmax attention with an additive per-(row, key) score BIAS and an optional
+/// per-head SINK, in f64 — matching `Op::Attention::key_bias`'s contract: the bias joins the score
+/// `q·K[j]*scale` BEFORE the softmax max (`sc[j] = q·K[j]*scale + bias[row,j]`), indexed by key
+/// POSITION `j`. Sink combination follows `attention_sinks_ref` exactly (max first, then the
+/// denominator, never the numerator) — CSA carries both on the same op at once.
+#[allow(clippy::too_many_arguments)]
+fn attention_bias_ref(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    rows: usize,
+    kv_len: usize,
+    n_head: usize,
+    n_kv: usize,
+    hd: usize,
+    scale: f32,
+    pos: usize,
+    bias: Option<&[f32]>,
+    sink: Option<&[f32]>,
+) -> Vec<f32> {
+    let group = n_head / n_kv;
+    let mut out = vec![0f32; rows * n_head * hd];
+    for ti in 0..rows {
+        for h in 0..n_head {
+            let kvh = h / group;
+            let qb = (ti * n_head + h) * hd;
+            let hi = (pos + ti + 1).min(kv_len);
+            let sc: Vec<f64> = (0..hi)
+                .map(|j| {
+                    let kb = (j * n_kv + kvh) * hd;
+                    let dot: f64 = (0..hd)
+                        .map(|d| q[qb + d] as f64 * k[kb + d] as f64)
+                        .sum::<f64>()
+                        * scale as f64;
+                    dot + bias.map_or(0.0, |b| b[ti * kv_len + j] as f64)
+                })
+                .collect();
+            let mut m = sc.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            if let Some(s) = sink {
+                m = m.max(s[h] as f64);
+            }
+            let mut l: f64 = sc.iter().map(|&s| (s - m).exp()).sum();
+            if let Some(s) = sink {
+                l += (s[h] as f64 - m).exp();
+            }
+            for (j, &s) in sc.iter().enumerate() {
+                let p = (s - m).exp() / l;
+                let vb = (j * n_kv + kvh) * hd;
+                for d in 0..hd {
+                    out[qb + d] += (p * v[vb + d] as f64) as f32;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `Op::Attention::key_bias` matches the from-definition f64 reference, alone AND combined with
+/// `sinks` on the SAME op — the actual DeepSeek V4 CSA shape, and the one a two-kernel design
+/// (one kernel for sinks, a different one for key_bias) would silently get wrong: whichever kernel
+/// runs would simply not apply the other field.
+///
+/// q and the KV cache are f16, matching the seam's real producer→consumer dtype flow (and what the
+/// Vulkan `attention_kv` bias builds require — see the adapter's f16 check next to `key_bias`).
+#[test]
+fn attention_key_bias_matches_f64_reference_and_combines_with_sinks() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, nkv, hd) = (3usize, 2usize, 1usize, 8usize);
+    let kv_len = rows;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let n_out = rows * nh * hd;
+
+    let to_f16 = |v: &[f32]| -> Vec<u8> {
+        v.iter()
+            .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+            .collect()
+    };
+    let deq = |b: &[u8]| -> Vec<f32> {
+        b.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| half::f16::from_le_bytes(c).to_f32())
+            .collect()
+    };
+    let qf = to_f16(&gen(rows * nh * hd, 34));
+    let kf = to_f16(&gen(kv_len * nkv * hd, 38));
+    let vf = to_f16(&gen(kv_len * nkv * hd, 39));
+    let (qd, kd, vd) = (deq(&qf), deq(&kf), deq(&vf));
+
+    // Moderate, distinct-per-(row,key) values — big enough to move the answer, nowhere near
+    // dominating it (that case is `attention_key_bias_joins_before_the_max`, below).
+    let bias: Vec<f32> = gen(rows * kv_len, 44).iter().map(|v| v * 3.0).collect();
+    let sinks = vec![2.0f32, -5.0];
+
+    let build = |with_bias: bool, with_sinks: bool| {
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![rows * nh * hd], DType::F16));
+        let kc = g.input(TensorDesc::new(vec![kv_len * nkv * hd], DType::F16));
+        let vc = g.input(TensorDesc::new(vec![kv_len * nkv * hd], DType::F16));
+        let kb = with_bias.then(|| g.input(f32d(rows * kv_len)));
+        let sk = g.weight(f32d(nh));
+        let dst = g.output(f32d(n_out));
+        g.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: AttnMask::Causal,
+            pos: 0,
+            sinks: with_sinks.then_some(sk),
+            key_bias: kb,
+        });
+        (g, q, kc, vc, kb, sk, dst)
+    };
+    let go = |be: &dyn Backend, with_bias: bool, with_sinks: bool| -> Vec<f32> {
+        let (g, q, kc, vc, kb, sk, dst) = build(with_bias, with_sinks);
+        let plan = be.compile(&g).expect("compile");
+        let up = |bytes: &[u8], usage| {
+            let b = be.alloc(bytes.len(), usage).expect("alloc");
+            be.upload(b.as_ref(), bytes).unwrap();
+            b
+        };
+        let qb = up(&qf, BufferUsage::Activations);
+        let kcb = up(&kf, BufferUsage::KvCache);
+        let vcb = up(&vf, BufferUsage::KvCache);
+        let ob = be.alloc(n_out * 4, BufferUsage::Readback).unwrap();
+        let mut b = Bindings::new();
+        b.bind(q, qb.as_ref());
+        b.bind(kc, kcb.as_ref());
+        b.bind(vc, vcb.as_ref());
+        b.bind(dst, ob.as_ref());
+        let kbb = with_bias.then(|| up(bytemuck::cast_slice(&bias), BufferUsage::Activations));
+        if let (Some(id), Some(buf)) = (kb, &kbb) {
+            b.bind(id, buf.as_ref());
+        }
+        let skb = with_sinks.then(|| up(bytemuck::cast_slice(&sinks), BufferUsage::Weights));
+        if let Some(buf) = &skb {
+            b.bind(sk, buf.as_ref());
+        }
+        be.execute(plan.as_ref(), &b).expect("execute");
+        let mut o = vec![0f32; n_out];
+        be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+            .unwrap();
+        o
+    };
+
+    let want_bias_only = attention_bias_ref(
+        &qd,
+        &kd,
+        &vd,
+        rows,
+        kv_len,
+        nh,
+        nkv,
+        hd,
+        scale,
+        0,
+        Some(&bias),
+        None,
+    );
+    let want_sinks_only = attention_bias_ref(
+        &qd,
+        &kd,
+        &vd,
+        rows,
+        kv_len,
+        nh,
+        nkv,
+        hd,
+        scale,
+        0,
+        None,
+        Some(&sinks),
+    );
+    let want_both = attention_bias_ref(
+        &qd,
+        &kd,
+        &vd,
+        rows,
+        kv_len,
+        nh,
+        nkv,
+        hd,
+        scale,
+        0,
+        Some(&bias),
+        Some(&sinks),
+    );
+    // Well-posedness: bias-only, sinks-only and both-combined must be three genuinely different
+    // answers, or a test passing against one says nothing about whether the op reads both fields.
+    assert!(
+        maxerr(&want_bias_only, &want_sinks_only) > 1e-2,
+        "fixture not well posed"
+    );
+    assert!(
+        maxerr(&want_both, &want_bias_only) > 1e-2,
+        "fixture not well posed"
+    );
+    assert!(
+        maxerr(&want_both, &want_sinks_only) > 1e-2,
+        "fixture not well posed"
+    );
+
+    let check = |be: &dyn Backend, name: &str| {
+        let got_bias = go(be, true, false);
+        let e = maxerr(&got_bias, &want_bias_only);
+        println!("Attention key_bias({name}) bias-only max_err={e:e}");
+        assert!(
+            e < 1e-2,
+            "{name}: key_bias-only diverges from the f64 reference: max_err={e:e}"
+        );
+
+        let got_sinks = go(be, false, true);
+        let e = maxerr(&got_sinks, &want_sinks_only);
+        println!("Attention key_bias({name}) sinks-only (bias absent) max_err={e:e}");
+        assert!(
+            e < 1e-3,
+            "{name}: sinks-only path moved when key_bias is None: max_err={e:e}"
+        );
+
+        let got_both = go(be, true, true);
+        let e = maxerr(&got_both, &want_both);
+        println!("Attention key_bias({name}) bias+sinks max_err={e:e}");
+        assert!(
+            e < 1e-2,
+            "{name}: key_bias+sinks diverges from the f64 reference: max_err={e:e}"
+        );
+        // The specific injection this catches: key_bias silently ignored once sinks is also set.
+        assert!(
+            maxerr(&got_both, &got_sinks) > 1e-2,
+            "{name}: key_bias made no difference once sinks was also present"
+        );
+    };
+    check(&cpu, "cpu");
+    if let Some(vk) = gpu() {
+        check(&vk, "vulkan");
+    }
+}
+
+/// A `-inf` bias row really removes the masked key — output equals attention restricted to the
+/// keys that were NOT `-inf`'d — the same equivalence `mla_key_bias_removes_the_masked_keys`
+/// checks for `Op::Mla`. `AttnMask::Canvas` isn't available here (the Vulkan sinks/key_bias build
+/// refuses it — see the adapter's `Op::Attention` arm), so both runs use a single query row placed
+/// at the LAST position of its own cache (`pos = kv_len - 1`), which makes ordinary `Causal`
+/// attend the whole cache — equivalent to Canvas for a one-row query.
+#[test]
+fn attention_key_bias_removes_the_masked_keys() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (nh, nkv, hd) = (2usize, 1usize, 4usize);
+    let scale = 1.0 / (hd as f32).sqrt();
+
+    // Three logical keys; key 1 — the one the mask removes — is scaled up so it DOMINATES the
+    // softmax: removing a key that barely contributed would make "the output changed" a tolerance
+    // argument instead of an observation.
+    let keys: Vec<Vec<f32>> = (0..3)
+        .map(|j| {
+            let s = if j == 1 { 4.0 } else { 1.0 };
+            gen(nkv * hd, 50 + j).iter().map(|v| v * s).collect()
+        })
+        .collect();
+    let vals: Vec<Vec<f32>> = (0..3).map(|j| gen(nkv * hd, 60 + j)).collect();
+    let qv = gen(nh * hd, 70);
+    let qf: Vec<u8> = qv
+        .iter()
+        .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+        .collect();
+
+    let run = |be: &dyn Backend,
+               cache_keys: &[Vec<f32>],
+               cache_vals: &[Vec<f32>],
+               bias: Option<&[f32]>|
+     -> Vec<f32> {
+        let kv_len = cache_keys.len();
+        let n_out = nh * hd;
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![nh * hd], DType::F16));
+        let kc = g.input(TensorDesc::new(vec![kv_len * nkv * hd], DType::F16));
+        let vc = g.input(TensorDesc::new(vec![kv_len * nkv * hd], DType::F16));
+        let kb = bias.map(|_| g.input(f32d(kv_len)));
+        let dst = g.output(f32d(n_out));
+        g.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: 1,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: AttnMask::Causal,
+            pos: (kv_len - 1) as u32,
+            sinks: None,
+            key_bias: kb,
+        });
+        let to_f16 = |rows: &[Vec<f32>]| -> Vec<u8> {
+            rows.iter()
+                .flatten()
+                .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+                .collect()
+        };
+        let kf = to_f16(cache_keys);
+        let vf = to_f16(cache_vals);
+        let plan = be.compile(&g).unwrap();
+        let up = |bytes: &[u8], usage| {
+            let b = be.alloc(bytes.len(), usage).unwrap();
+            be.upload(b.as_ref(), bytes).unwrap();
+            b
+        };
+        let qb = up(&qf, BufferUsage::Activations);
+        let kcb = up(&kf, BufferUsage::KvCache);
+        let vcb = up(&vf, BufferUsage::KvCache);
+        let ob = be.alloc(n_out * 4, BufferUsage::Readback).unwrap();
+        let mut b = Bindings::new();
+        b.bind(q, qb.as_ref());
+        b.bind(kc, kcb.as_ref());
+        b.bind(vc, vcb.as_ref());
+        b.bind(dst, ob.as_ref());
+        let bb = bias.map(|bv| {
+            let buf = be.alloc(bv.len() * 4, BufferUsage::Activations).unwrap();
+            be.upload(buf.as_ref(), bytemuck::cast_slice(bv)).unwrap();
+            buf
+        });
+        if let (Some(id), Some(buf)) = (kb, bb.as_ref()) {
+            b.bind(id, buf.as_ref());
+        }
+        be.execute(plan.as_ref(), &b).unwrap();
+        let mut o = vec![0f32; n_out];
+        be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+            .unwrap();
+        o
+    };
+
+    let ninf = f32::NEG_INFINITY;
+
+    // Which key the mask removes is not a free parameter: masking key 0 — the FIRST key a row
+    // processes — is what separates the three backends' softmax formulations. A kernel that keeps
+    // a RUNNING max seeded at `-inf` computes `exp(m - mnew)` as `exp(-inf - -inf)`, i.e. NaN, and
+    // poisons the row's accumulators even once a selected key arrives; one that takes the row max
+    // in a separate pass (the CPU arm) or seeds it finite (Vulkan's `-3.0e38`) cannot. Metal is
+    // the online one, so this case is why its `#[ignore]`d parity test is worth running on CI.
+    for masked_j in 0..3usize {
+        let bias3: Vec<f32> = (0..3)
+            .map(|j| if j == masked_j { ninf } else { 0.0 })
+            .collect();
+        let kept: Vec<usize> = (0..3).filter(|&j| j != masked_j).collect();
+        let kept_keys: Vec<Vec<f32>> = kept.iter().map(|&j| keys[j].clone()).collect();
+        let kept_vals: Vec<Vec<f32>> = kept.iter().map(|&j| vals[j].clone()).collect();
+
+        for (name, be) in [("cpu", &cpu as &dyn Backend)]
+            .into_iter()
+            .chain(gpu().iter().map(|vk| ("vulkan", vk as &dyn Backend)))
+        {
+            let masked = run(be, &keys, &vals, Some(&bias3));
+            assert!(
+                masked.iter().all(|v| v.is_finite()),
+                "{name}: masking key {masked_j} produced a non-finite output — a running-max \
+                 softmax seeded at -inf hits `exp(-inf - -inf)` on an all-masked prefix\n  \
+                 got={masked:?}"
+            );
+            let subset = run(be, &kept_keys, &kept_vals, None);
+            let e = maxerr(&masked, &subset);
+            println!("Attention key_bias {name}: masked j={masked_j} vs subset max_err={e:e}");
+            assert!(
+                e < 1e-3,
+                "{name}: a -inf-masked key (j={masked_j}) still influenced the output \
+                 (max_err={e:e})\n  masked={masked:?}\n  subset={subset:?}"
+            );
+            let unmasked = run(be, &keys, &vals, None);
+            let d = maxerr(&masked, &unmasked);
+            println!("Attention key_bias {name}: masked j={masked_j} vs unmasked max|Δ|={d:e}");
+            assert!(
+                d > 1e-3,
+                "{name}: masking key {masked_j} changed nothing — key_bias is not reaching the \
+                 kernel"
+            );
+        }
+    }
+}
+
+/// The bias joins the score BEFORE the softmax max, not after it — `Op::Attention::key_bias`'s
+/// doc says so explicitly, and getting it backwards is invisible at moderate bias values (softmax
+/// is shift-invariant in EXACT arithmetic — subtracting the wrong-but-finite max cancels out of
+/// the ratio). It only shows up once a bias is large enough that leaving it out of the max
+/// overflows the f32 `exp` on the way to the (still mathematically well-defined) answer: a bias of
+/// `95` on one key, scores otherwise O(1), makes `exp(bias_score - wrong_max) ≈ exp(94)`, far past
+/// `f32::MAX`'s `exp(88.7)` — so the wrong ordering doesn't just skew the weights, it turns them
+/// into `inf`/`NaN`. The correct ordering never does: shifting by the TRUE max keeps every exponent
+/// `<= 0`.
+#[test]
+fn attention_key_bias_joins_before_the_max() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, nkv, hd) = (3usize, 2usize, 1usize, 8usize);
+    let kv_len = rows;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let n_out = rows * nh * hd;
+
+    let to_f16 = |v: &[f32]| -> Vec<u8> {
+        v.iter()
+            .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+            .collect()
+    };
+    let deq = |b: &[u8]| -> Vec<f32> {
+        b.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| half::f16::from_le_bytes(c).to_f32())
+            .collect()
+    };
+    let qf = to_f16(&gen(rows * nh * hd, 84));
+    let kf = to_f16(&gen(kv_len * nkv * hd, 88));
+    let vf = to_f16(&gen(kv_len * nkv * hd, 89));
+    let (qd, kd, vd) = (deq(&qf), deq(&kf), deq(&vf));
+
+    // Row 2 is the only row that sees all 3 keys (causal); key 0 there gets the dominant bias.
+    let mut bias = vec![0f32; rows * kv_len];
+    bias[2 * kv_len] = 95.0;
+
+    let build = |with_bias: bool| {
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![rows * nh * hd], DType::F16));
+        let kc = g.input(TensorDesc::new(vec![kv_len * nkv * hd], DType::F16));
+        let vc = g.input(TensorDesc::new(vec![kv_len * nkv * hd], DType::F16));
+        let kb = g.input(f32d(rows * kv_len));
+        let dst = g.output(f32d(n_out));
+        g.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: AttnMask::Causal,
+            pos: 0,
+            sinks: None,
+            key_bias: with_bias.then_some(kb),
+        });
+        (g, q, kc, vc, kb, dst)
+    };
+    let go = |be: &dyn Backend, with_bias: bool| -> Vec<f32> {
+        let (g, q, kc, vc, kb, dst) = build(with_bias);
+        let plan = be.compile(&g).expect("compile");
+        let up = |bytes: &[u8], usage| {
+            let b = be.alloc(bytes.len(), usage).expect("alloc");
+            be.upload(b.as_ref(), bytes).unwrap();
+            b
+        };
+        let qb = up(&qf, BufferUsage::Activations);
+        let kcb = up(&kf, BufferUsage::KvCache);
+        let vcb = up(&vf, BufferUsage::KvCache);
+        let ob = be.alloc(n_out * 4, BufferUsage::Readback).unwrap();
+        let mut b = Bindings::new();
+        b.bind(q, qb.as_ref());
+        b.bind(kc, kcb.as_ref());
+        b.bind(vc, vcb.as_ref());
+        b.bind(dst, ob.as_ref());
+        let kbb = with_bias.then(|| up(bytemuck::cast_slice(&bias), BufferUsage::Activations));
+        if let Some(buf) = &kbb {
+            b.bind(kb, buf.as_ref());
+        }
+        be.execute(plan.as_ref(), &b).expect("execute");
+        let mut o = vec![0f32; n_out];
+        be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+            .unwrap();
+        o
+    };
+
+    let want = attention_bias_ref(
+        &qd,
+        &kd,
+        &vd,
+        rows,
+        kv_len,
+        nh,
+        nkv,
+        hd,
+        scale,
+        0,
+        Some(&bias),
+        None,
+    );
+    assert!(
+        want.iter().all(|x| x.is_finite()),
+        "fixture not well posed: the f64 reference itself is non-finite"
+    );
+
+    let check = |be: &dyn Backend, name: &str| {
+        let got = go(be, true);
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "{name}: key_bias output has a non-finite value — the bias is joining AFTER the max \
+             instead of before it, overflowing exp() on the dominant key: {got:?}"
+        );
+        let e = maxerr(&got, &want);
+        println!("Attention key_bias({name}) before-max max_err={e:e}");
+        assert!(
+            e < 1e-1,
+            "{name}: dominant-bias key_bias wrong: max_err={e:e}"
+        );
+    };
+    check(&cpu, "cpu");
+    if let Some(vk) = gpu() {
+        check(&vk, "vulkan");
+    }
+}
+
+/// `key_bias` indexes by absolute key POSITION `j`, never the ring-cache row `j % cap_rows` — the
+/// one invariant `Op::Attention::key_bias`'s doc calls out by name. A ring cache only exists under
+/// `AttnMask::SlidingWindow`, where the cache holds fewer physical rows than `kv_len` and
+/// recycles them (row `r` holds whichever position last wrote it).
+///
+/// Setup: `window = cap_rows = 3`, `kv_len = 5`, a single query at `pos = 4`. Causally-visible
+/// positions are `{2, 3, 4}`, which fill physical rows `{2, 0, 1}` respectively (position 3
+/// overwrote row 0, position 4 overwrote row 1; position 2 still owns row 2). The bias array
+/// covers all 5 logical positions with a DIFFERENT value at every index — position 3 gets `-inf`,
+/// positions 0 and 1 (never attended, but aliased to rows 0 and 1 under the wrong indexing) get
+/// large, easy-to-spot poison values instead of anything resembling `-inf`. Reading `bias[j]`
+/// masks position 3 correctly; reading `bias[j % cap_rows]` instead reads the poison values at
+/// `bias[0]`/`bias[1]` and never masks anything.
+#[test]
+fn attention_key_bias_indexed_by_key_position_not_ring_row() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (nh, nkv, hd) = (1usize, 1usize, 4usize);
+    let scale = 1.0 / (hd as f32).sqrt();
+    let (kv_len, cap_rows, window, pos) = (5usize, 3usize, 3usize, 4usize);
+    let n_out = nh * hd;
+
+    let qv = gen(nh * hd, 90);
+    let qf: Vec<u8> = qv
+        .iter()
+        .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+        .collect();
+    // One distinct K/V row per logical position 0..kv_len.
+    let keys: Vec<Vec<f32>> = (0..kv_len).map(|j| gen(nkv * hd, 100 + j)).collect();
+    let vals: Vec<Vec<f32>> = (0..kv_len).map(|j| gen(nkv * hd, 110 + j)).collect();
+    let to_f16 = |rows: &[Vec<f32>]| -> Vec<u8> {
+        rows.iter()
+            .flatten()
+            .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+            .collect()
+    };
+    // Physical ring layout after positions 0..=4 have been written in order, cap_rows = 3:
+    // row 0 <- position 3 (3 % 3 == 0), row 1 <- position 4 (4 % 3 == 1), row 2 <- position 2
+    // (2 % 3 == 2, never overwritten by 3 or 4).
+    let ring_keys = vec![keys[3].clone(), keys[4].clone(), keys[2].clone()];
+    let ring_vals = vec![vals[3].clone(), vals[4].clone(), vals[2].clone()];
+    let kf = to_f16(&ring_keys);
+    let vf = to_f16(&ring_vals);
+
+    // Poison at the aliased-but-unvisited indices 0/1; a real per-position mask at 2/3/4.
+    let ninf = f32::NEG_INFINITY;
+    let bias = [1000.0f32, -1000.0, 30.0, ninf, 50.0];
+
+    let build = || {
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![nh * hd], DType::F16));
+        let kc = g.input(TensorDesc::new(vec![cap_rows * nkv * hd], DType::F16));
+        let vc = g.input(TensorDesc::new(vec![cap_rows * nkv * hd], DType::F16));
+        let kb = g.input(f32d(kv_len));
+        let dst = g.output(f32d(n_out));
+        g.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: 1,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: AttnMask::SlidingWindow(window),
+            pos: pos as u32,
+            sinks: None,
+            key_bias: Some(kb),
+        });
+        (g, q, kc, vc, kb, dst)
+    };
+    let go = |be: &dyn Backend| -> Vec<f32> {
+        let (g, q, kc, vc, kb, dst) = build();
+        let plan = be.compile(&g).expect("compile");
+        let up = |bytes: &[u8], usage| {
+            let b = be.alloc(bytes.len(), usage).expect("alloc");
+            be.upload(b.as_ref(), bytes).unwrap();
+            b
+        };
+        let qb = up(&qf, BufferUsage::Activations);
+        let kcb = up(&kf, BufferUsage::KvCache);
+        let vcb = up(&vf, BufferUsage::KvCache);
+        let kbb = up(bytemuck::cast_slice(&bias), BufferUsage::Activations);
+        let ob = be.alloc(n_out * 4, BufferUsage::Readback).unwrap();
+        let mut b = Bindings::new();
+        b.bind(q, qb.as_ref());
+        b.bind(kc, kcb.as_ref());
+        b.bind(vc, vcb.as_ref());
+        b.bind(kb, kbb.as_ref());
+        b.bind(dst, ob.as_ref());
+        be.execute(plan.as_ref(), &b).expect("execute");
+        let mut o = vec![0f32; n_out];
+        be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+            .unwrap();
+        o
+    };
+
+    // Reference: the reduced 3-key problem at positions {2,3,4}, renumbered 0,1,2, biased by
+    // {30, -inf, 50} — exactly what indexing by key POSITION should read out of `bias`.
+    let deq = |b: &[u8]| -> Vec<f32> {
+        b.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| half::f16::from_le_bytes(c).to_f32())
+            .collect()
+    };
+    let qd = deq(&qf);
+    let kd: Vec<f32> = [keys[2].clone(), keys[3].clone(), keys[4].clone()].concat();
+    let vd: Vec<f32> = [vals[2].clone(), vals[3].clone(), vals[4].clone()].concat();
+    let bias_reduced = [30.0f32, ninf, 50.0];
+    let want = attention_bias_ref(
+        &qd,
+        &kd,
+        &vd,
+        1,
+        3,
+        nh,
+        nkv,
+        hd,
+        scale,
+        2,
+        Some(&bias_reduced),
+        None,
+    );
+
+    let check = |be: &dyn Backend, name: &str| {
+        let got = go(be);
+        let e = maxerr(&got, &want);
+        println!("Attention key_bias({name}) ring-cache max_err={e:e}");
+        assert!(
+            e < 1e-2,
+            "{name}: key_bias is indexed by the ring row, not the key position: max_err={e:e}\n  \
+             got={got:?}\n  want={want:?}"
         );
     };
     check(&cpu, "cpu");

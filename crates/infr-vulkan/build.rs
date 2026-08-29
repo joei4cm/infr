@@ -736,6 +736,16 @@ fn main() {
         // f16 KV, static, bound (no Q8 / BDA / params twins): the adapter forces a sinks op onto
         // this scalar path and errors on the shapes it can't serve.
         ("attention_kv", "attention_kv_sinks", &["-DSINKS"]),
+        // `Op::Attention::key_bias` (deepseek4 CSA's top-k mask, `Op::TopkMask`'s output): the same
+        // ONE-build rule as SINKS above, and the two combine independently (`-DBIAS`, and
+        // `-DSINKS -DBIAS` for CSA layers which carry both) — the mirror of `mla`'s
+        // FREQ_FACTORS x KEY_BIAS axes.
+        ("attention_kv", "attention_kv_bias", &["-DBIAS"]),
+        (
+            "attention_kv",
+            "attention_kv_sinks_bias",
+            &["-DSINKS", "-DBIAS"],
+        ),
         // Planar Q8_0 KV cache: scalar dequant-on-read variants. K/V decouple (-DKQ8 / -DVQ8) → 3
         // quant combos for the STATIC scalar path; coupled-only for the record-once (dead for Q8).
         ("attention_kv", "attention_kv_q8", &["-DKQ8", "-DVQ8"]),

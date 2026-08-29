@@ -76,6 +76,14 @@ layout(binding = 2) readonly buffer VB { float16_t v[]; };
 // `o` moves to binding 4 (params takes binding 3) so the recorder's reads|writes split is output-last.
 layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; };
 layout(binding = 4) buffer OB { float o[]; };
+#elif defined(SINKS) && defined(BIAS)
+// -DSINKS -DBIAS build (`attention_kv_sinks_bias`): both extras at once — DeepSeek V4's CSA
+// layers carry `attn_sinks` AND the lightning indexer's top-k mask on the SAME attention. Sinks
+// at binding 3, bias at binding 4, `o` last at 5 — same order MLA's `-DFREQ_FACTORS -DKEY_BIAS`
+// build binds its two optionals in (see `mla.comp`).
+layout(binding = 3) readonly buffer SB { float sink[]; };
+layout(binding = 4) readonly buffer BB { float bias[]; };
+layout(binding = 5) buffer OB { float o[]; };
 #elif defined(SINKS)
 // -DSINKS build (`attention_kv_sinks`): per-head attention-sink logits `[nh]` at binding 3, `o`
 // last at 4. One extra logit per head that joins the softmax MAX and DENOMINATOR and contributes
@@ -84,8 +92,24 @@ layout(binding = 4) buffer OB { float o[]; };
 // shapes this build can't serve rather than silently dropping the sink.
 layout(binding = 3) readonly buffer SB { float sink[]; };
 layout(binding = 4) buffer OB { float o[]; };
+#elif defined(BIAS)
+// -DBIAS build (`attention_kv_bias`): additive per-(row, key) score mask `[q_len, kv_len]` at
+// binding 3, `o` last at 4 — `Op::Attention::key_bias`, deepseek4 CSA's top-k mask
+// (`Op::TopkMask`'s output). Same plain-f16-KV-only restriction as SINKS.
+layout(binding = 3) readonly buffer BB { float bias[]; };
+layout(binding = 4) buffer OB { float o[]; };
 #else
 layout(binding = 3) buffer OB { float o[]; };
+#endif
+
+// Add the score mask at key POSITION `j` (the loop variable below, NOT the ring-adjusted row) for
+// query row `ti`. The no-bias build adds NOTHING rather than a literal 0.0 — same reasoning as
+// `mla.comp`'s `ADD_KEY_BIAS`: `x + 0.0` is not the identity on `-0.0`, so a shared expression
+// would cost every existing build an instruction and an IEEE corner it never had.
+#ifdef BIAS
+#define ADD_BIAS(s, row, j) ((s) + bias[(row) * pc.kv_len + (j)])
+#else
+#define ADD_BIAS(s, row, j) (s)
 #endif
 
 const uint TILE = 1024u;
@@ -148,7 +172,7 @@ void main() {
                 uint kbase = (jr * pc.nkv + kvh) * hd;
                 float dotv = 0.0;
                 for (uint d = 0u; d < hd; d++) { dotv += q_sh[d] * KREAD(kbase + d); }
-                s = dotv * scale;
+                s = ADD_BIAS(dotv * scale, ti, j);
             }
             sc[j - ts] = s;
             lmax = max(lmax, s);

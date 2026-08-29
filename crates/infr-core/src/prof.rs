@@ -327,6 +327,7 @@ mod tests {
                 mask: AttnMask::Causal,
                 pos: 0,
                 sinks: None,
+                key_bias: None,
             },
             Op::RmsNorm {
                 x,

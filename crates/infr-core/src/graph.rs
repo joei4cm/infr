@@ -395,6 +395,23 @@ pub enum Op {
         /// `None` for every arch in this codebase today, and on that path each backend runs the code
         /// it ran before this field existed — no current model's numerics can move.
         sinks: Option<TensorId>,
+        /// Optional additive per-(query row, key) score bias `[rows, kv_len]`, f32 — the same
+        /// semantic as [`Op::Mla::key_bias`], carried onto ordinary attention: added to the scaled
+        /// score `q·K[j] * scale` BEFORE the softmax max, indexed by KEY POSITION `j` (not the ring
+        /// cache row `j % cap_rows`), `-inf` at unselected keys.
+        ///
+        /// DeepSeek V4's CSA (compressed/selective attention) layers are the only caller: the
+        /// lightning indexer's top-k selection, expanded by [`Op::TopkMask`] into `0` on the
+        /// selected keys and `-inf` everywhere else — see that op's doc for why `-inf` is safe.
+        /// V4's CSA layers ALSO carry `sinks` (`deepseek4.cpp` passes `layer.attn_sinks` at every
+        /// attention call site, CSA included), so the two combine — each present or absent
+        /// independently — in the SAME kernel per backend, the way `sinks` already lives in exactly
+        /// one kernel: `attention_kv.comp`'s `-DSINKS`/`-DBIAS` builds on Vulkan, the
+        /// `ATTN_*_KERNEL` macro family on Metal, this one CPU arm.
+        ///
+        /// `None` for every arch in this codebase today, and on that path each backend runs the code
+        /// it ran before this field existed — no current model's numerics can move.
+        key_bias: Option<TensorId>,
     },
     /// Multi-head Latent Attention (DeepSeek V2/V3). Absorbed form: one compressed K row per token
     /// (V is an aliased prefix view), `wk_b` absorbs Q nope into the latent space before the dot
@@ -1239,10 +1256,12 @@ impl Op {
                 v_cache,
                 dst,
                 sinks,
+                key_bias,
                 ..
             } => {
                 let mut r = vec![q, k_cache, v_cache];
                 r.extend(sinks);
+                r.extend(key_bias);
                 (r, vec![dst])
             }
             Op::Mla {
@@ -1574,6 +1593,7 @@ mod tests {
             mask: AttnMask::Causal,
             pos: 0,
             sinks: None,
+            key_bias: None,
         };
         assert_eq!(attn.io(), (vec![t(7), t(6), t(8)], vec![t(9)]));
     }
@@ -1615,7 +1635,9 @@ mod tests {
             "V4's weightless Q norm reads no weight at all"
         );
         assert_eq!(qkn(Some(t(1))).io(), (vec![t(0), t(1)], vec![t(0)]));
-        let attn = |sk: Option<TensorId>| Op::Attention {
+        // `Op::Attention`'s key_bias is the same shape of optional read as `Op::Mla`'s, and combines
+        // independently with sinks (DeepSeek V4's CSA layers carry both at once).
+        let attn = |sk: Option<TensorId>, kb: Option<TensorId>| Op::Attention {
             q: t(0),
             k_cache: t(1),
             v_cache: t(2),
@@ -1629,15 +1651,25 @@ mod tests {
             mask: AttnMask::Causal,
             pos: 0,
             sinks: sk,
+            key_bias: kb,
         };
         assert_eq!(
-            attn(None).io(),
+            attn(None, None).io(),
             (vec![t(0), t(1), t(2)], vec![t(3)]),
-            "every existing arch (sinks None) reads exactly what it always did"
+            "every existing arch (sinks and key_bias both None) reads exactly what it always did"
         );
         assert_eq!(
-            attn(Some(t(4))).io(),
+            attn(Some(t(4)), None).io(),
             (vec![t(0), t(1), t(2), t(4)], vec![t(3)])
+        );
+        assert_eq!(
+            attn(None, Some(t(5))).io(),
+            (vec![t(0), t(1), t(2), t(5)], vec![t(3)])
+        );
+        assert_eq!(
+            attn(Some(t(4)), Some(t(5))).io(),
+            (vec![t(0), t(1), t(2), t(4), t(5)], vec![t(3)]),
+            "sinks and key_bias combine — CSA's shape"
         );
         // `Op::Mla`'s optional top-k score mask is the same shape of optional read operand.
         let mla = |kb: Option<TensorId>| Op::Mla {
@@ -1705,6 +1737,7 @@ mod tests {
             mask: AttnMask::Causal,
             pos: 0,
             sinks: None,
+            key_bias: None,
         });
         // A non-KV op must NOT contribute any in-place input.
         g.push(Op::Add {

@@ -1755,6 +1755,7 @@ impl Backend for CpuBackend {
                     mask,
                     pos,
                     sinks,
+                    key_bias,
                 } => {
                     let (rows, kv_len, nh, nkv, hd) = (
                         rows as usize,
@@ -1814,6 +1815,9 @@ impl Backend for CpuBackend {
                     // extra logit per head in the max AND the denominator, never in the numerator.
                     // See `Op::Attention::sinks`.
                     let sk = sinks.map(&weight);
+                    // DeepSeek V4 CSA's additive per-(row, key) top-k score mask (`None` everywhere
+                    // else) — indexed by KEY POSITION, not the ring row. See `Op::Attention::key_bias`.
+                    let kbias = key_bias.map(|b| vals[b.0 as usize].clone());
                     let group = nh / nkv;
                     // `Causal`/`SlidingWindow` clip the causal END at `abs+1` (per-row, from
                     // `pos`); `Canvas` (DiffusionGemma denoise — see `AttnMask::Canvas`'s doc)
@@ -1858,6 +1862,11 @@ impl Backend for CpuBackend {
                             // scalar in an earlier campaign only because the reassociation
                             // flipped a golden hash; the numerics policy now allows it).
                             *scj = dot(qrow, &ks[kb..kb + hd]) * scale;
+                            // The top-k mask joins the score BEFORE the max, at key POSITION `j`
+                            // (not the ring row `jr`) — same rule as `Op::Mla::key_bias`.
+                            if let Some(kbias) = &kbias {
+                                *scj += kbias[ti * kv_len + j];
+                            }
                             mx = mx.max(*scj);
                         }
                         // The sink joins the max first (so a dominating sink can't overflow the

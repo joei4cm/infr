@@ -2497,6 +2497,7 @@ fn q8_attention_test(rows: usize, kv_len: usize, hd: usize, pos: usize, tol: f32
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
         sinks: None,
+        key_bias: None,
     });
     let nkv_elems = kv_len * nkv * hd;
     let bound = vec![
@@ -2599,6 +2600,7 @@ fn kvquant_attention_test(
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
         sinks: None,
+        key_bias: None,
     });
     let nkv_elems = kv_len * nkv * hd;
     let bound = vec![
@@ -2733,6 +2735,7 @@ fn attention_gqa_causal_parity() {
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
         sinks: None,
+        key_bias: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 41))),
@@ -2773,6 +2776,7 @@ fn attention_decode_hd256_short_kv_parity() {
             mask: infr_core::graph::AttnMask::Causal,
             pos: pos as u32,
             sinks: None,
+            key_bias: None,
         });
         let bound = vec![
             (q, f32_bytes(&rand_f32(rows * nh * hd, 71 + kv_len as u64))),
@@ -2814,6 +2818,7 @@ fn attention_prefill_wide_parity() {
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
         sinks: None,
+        key_bias: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 61))),
@@ -2850,6 +2855,7 @@ fn attention_flash_matches_reference() {
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
         sinks: None,
+        key_bias: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 71))),
@@ -2885,6 +2891,7 @@ fn attention_flash_hd72_matches_reference() {
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
         sinks: None,
+        key_bias: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 171))),
@@ -2920,6 +2927,7 @@ fn attention_flash2_hd128_matches_reference() {
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
         sinks: None,
+        key_bias: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 181))),
@@ -2955,6 +2963,7 @@ fn attention_flash2_four_row_prefill_match(
         mask,
         pos: pos as u32,
         sinks: None,
+        key_bias: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, seed))),
@@ -3011,6 +3020,7 @@ fn attention_flash2_hd256_matches_reference() {
         mask: infr_core::graph::AttnMask::SlidingWindow(64),
         pos: pos as u32,
         sinks: None,
+        key_bias: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 401))),
@@ -3045,6 +3055,7 @@ fn attention_vec_hd256_sliding_window_parity() {
         mask: infr_core::graph::AttnMask::SlidingWindow(96),
         pos: pos as u32,
         sinks: None,
+        key_bias: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 404))),
@@ -3080,6 +3091,7 @@ fn attention_flash2_sliding_window_parity() {
         mask: infr_core::graph::AttnMask::SlidingWindow(64),
         pos: pos as u32,
         sinks: None,
+        key_bias: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 191))),
@@ -3115,6 +3127,7 @@ fn attention_long_context_split32_parity() {
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
         sinks: None,
+        key_bias: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 51))),
@@ -3149,6 +3162,7 @@ fn attention_long_context_split32_hd96_parity() {
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
         sinks: None,
+        key_bias: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 201))),
@@ -3185,6 +3199,7 @@ fn attention_vec_sliding_window_parity() {
         mask: infr_core::graph::AttnMask::SlidingWindow(win),
         pos: pos as u32,
         sinks: None,
+        key_bias: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 211))),
@@ -3218,6 +3233,7 @@ fn attention_sliding_window_parity() {
         mask: infr_core::graph::AttnMask::SlidingWindow(win),
         pos: pos as u32,
         sinks: None,
+        key_bias: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 44))),
@@ -3754,6 +3770,7 @@ fn attention_canvas_split32_matches_reference() {
         // — 0 here matches how the denoise call site sizes it (see `Op::Attention`'s doc).
         pos: 0,
         sinks: None,
+        key_bias: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 501))),
@@ -3788,6 +3805,7 @@ fn attention_canvas_split8_hd256_matches_reference() {
         mask: infr_core::graph::AttnMask::Canvas { lo },
         pos: 0,
         sinks: None,
+        key_bias: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 511))),
@@ -4760,6 +4778,7 @@ fn attention_sinks_parity() {
             mask: infr_core::graph::AttnMask::Causal,
             pos: 0,
             sinks: with_sinks.then_some(sk),
+            key_bias: None,
         });
         (g, q, kc, vc, sk, dst)
     };
@@ -4805,6 +4824,203 @@ fn attention_sinks_parity() {
         "metal: a sink 18 above every score changed nothing (gap={gap:e}) — it never reached the \
          denominator"
     );
+}
+
+/// `Op::Attention { key_bias }` — DeepSeek V4 CSA's top-k score mask, alone AND combined with
+/// `sinks` on the SAME op (CSA's actual shape, and the one a two-kernel design would silently get
+/// wrong — see `attention_key_bias_matches_f64_reference_and_combines_with_sinks` in
+/// `infr-llama`'s `seam_op_parity.rs`, which pins the semantics against an f64 reference; this one
+/// only asks whether Metal reproduces the CPU oracle). A `-inf` row on one key must reproduce the
+/// same output as dropping that key from the cache outright, matching `key_bias`'s doc.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_key_bias_parity() {
+    let (rows, nh, nkv, hd) = (4usize, 4usize, 2usize, 64usize);
+    let kv_len = rows;
+    let n_out = rows * nh * hd;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let qi = rand_f32(n_out, 5244);
+    let ki = rand_f32(kv_len * nkv * hd, 5245);
+    let vi = rand_f32(kv_len * nkv * hd, 5246);
+    // Distinct per-(row, key) bias, moderate magnitude — enough to move the answer without
+    // overflowing anything.
+    let bias = rand_f32(rows * kv_len, 5247)
+        .iter()
+        .map(|v| v * 6.0)
+        .collect::<Vec<f32>>();
+    let sinks = vec![3.0f32, -3.0, 1.5, -1.5];
+
+    let build = |with_bias: bool, with_sinks: bool| {
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+        let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+        let kb = with_bias.then(|| g.input(TensorDesc::new(vec![rows, kv_len], DType::F32)));
+        let sk = g.weight(TensorDesc::new(vec![nh], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        g.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: infr_core::graph::AttnMask::Causal,
+            pos: 0,
+            sinks: with_sinks.then_some(sk),
+            key_bias: kb,
+        });
+        (g, q, kc, vc, kb, sk, dst)
+    };
+    let bind = |q, kc, vc, kb: Option<TensorId>, sk, with_sinks: bool| {
+        let mut b = vec![
+            (q, f32_bytes(&qi)),
+            (kc, f32_bytes(&ki)),
+            (vc, f32_bytes(&vi)),
+        ];
+        if let Some(id) = kb {
+            b.push((id, f32_bytes(&bias)));
+        }
+        if with_sinks {
+            b.push((sk, f32_bytes(&sinks)));
+        }
+        b
+    };
+
+    for (with_bias, with_sinks) in [(true, false), (false, true), (true, true)] {
+        let (g, q, kc, vc, kb, sk, dst) = build(with_bias, with_sinks);
+        assert_parity(&g, &bind(q, kc, vc, kb, sk, with_sinks), dst, n_out, 1e-4);
+    }
+
+    // The bias must actually change the answer — otherwise the parity check above compares two
+    // runs that both ignored it.
+    let mtl_be = MetalBackend::new().expect("metal backend");
+    let (gb, q, kc, vc, kb, sk, dst) = build(true, false);
+    let with_bias = run(&mtl_be, &gb, &bind(q, kc, vc, kb, sk, false), dst, n_out);
+    let (gn, q, kc, vc, kb, sk, dst) = build(false, false);
+    let without_bias = run(&mtl_be, &gn, &bind(q, kc, vc, kb, sk, false), dst, n_out);
+    let gap = with_bias
+        .iter()
+        .zip(&without_bias)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        gap > 0.05,
+        "metal: key_bias changed nothing (gap={gap:e}) — it never reached the score"
+    );
+}
+
+/// A `-inf` bias row is equivalent to the masked key not being in the cache at all — same
+/// equivalence `attention_key_bias_removes_the_masked_keys` checks on CPU/Vulkan, here against the
+/// CPU oracle instead of an f64 reference. Single query row placed at the last position of its own
+/// cache (`pos = kv_len - 1`), so ordinary `Causal` attends the whole cache.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_key_bias_removes_the_masked_keys_parity() {
+    let (nh, nkv, hd) = (4usize, 2usize, 32usize);
+    let scale = 1.0 / (hd as f32).sqrt();
+    // Key 1 — the one the mask removes — is scaled up so it dominates the softmax.
+    let keys: Vec<Vec<f32>> = (0..3)
+        .map(|j| {
+            let s = if j == 1 { 4.0 } else { 1.0 };
+            rand_f32(nkv * hd, 6250 + j as u64)
+                .iter()
+                .map(|v| v * s)
+                .collect()
+        })
+        .collect();
+    let vals: Vec<Vec<f32>> = (0..3)
+        .map(|j| rand_f32(nkv * hd, 6260 + j as u64))
+        .collect();
+    let qv = rand_f32(nh * hd, 6270);
+
+    let run_case = |be: &dyn Backend,
+                    cache_keys: &[Vec<f32>],
+                    cache_vals: &[Vec<f32>],
+                    bias: Option<&[f32]>|
+     -> Vec<f32> {
+        let kv_len = cache_keys.len();
+        let n_out = nh * hd;
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![nh, hd], DType::F32));
+        let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+        let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+        let kb = bias.map(|_| g.input(TensorDesc::new(vec![kv_len], DType::F32)));
+        let dst = g.output(TensorDesc::new(vec![nh, hd], DType::F32));
+        g.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: 1,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: infr_core::graph::AttnMask::Causal,
+            pos: (kv_len - 1) as u32,
+            sinks: None,
+            key_bias: kb,
+        });
+        let mut b = vec![
+            (q, f32_bytes(&qv)),
+            (kc, f32_bytes(&cache_keys.concat())),
+            (vc, f32_bytes(&cache_vals.concat())),
+        ];
+        if let (Some(id), Some(bv)) = (kb, bias) {
+            b.push((id, f32_bytes(bv)));
+        }
+        run(be, &g, &b, dst, n_out)
+    };
+
+    let ninf = f32::NEG_INFINITY;
+    let mtl_be = MetalBackend::new().expect("metal backend");
+
+    // Every key in turn, and `masked_j == 0` is the one this backend can actually fail. Metal's
+    // attention is the ONLINE formulation — a running max seeded at `-INFINITY` — so an all-`-inf`
+    // prefix makes `exp(m - mnew)` compute `exp(-inf - -inf)`, i.e. NaN, poisoning the row's
+    // accumulators even after a selected key arrives. The CPU arm takes the row max in a separate
+    // pass and Vulkan seeds its per-tile max at a finite `-3.0e38`, so neither can reproduce it;
+    // this test is the only place it is observable.
+    for masked_j in 0..3usize {
+        let bias3: Vec<f32> = (0..3)
+            .map(|j| if j == masked_j { ninf } else { 0.0 })
+            .collect();
+        let kept: Vec<usize> = (0..3).filter(|&j| j != masked_j).collect();
+        let kept_keys: Vec<Vec<f32>> = kept.iter().map(|&j| keys[j].clone()).collect();
+        let kept_vals: Vec<Vec<f32>> = kept.iter().map(|&j| vals[j].clone()).collect();
+
+        let masked = run_case(&mtl_be, &keys, &vals, Some(&bias3));
+        assert!(
+            masked.iter().all(|v| v.is_finite()),
+            "metal: masking key {masked_j} produced a non-finite output — the running-max softmax \
+             hit `exp(-inf - -inf)` on an all-masked prefix\n  got={masked:?}"
+        );
+        let subset = run_case(&mtl_be, &kept_keys, &kept_vals, None);
+        assert_close(
+            &subset,
+            &masked,
+            1e-4,
+            &format!("metal key_bias masked-vs-subset (j={masked_j})"),
+        );
+
+        let unmasked = run_case(&mtl_be, &keys, &vals, None);
+        let gap = masked
+            .iter()
+            .zip(&unmasked)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            gap > 0.05,
+            "metal: masking key {masked_j} changed nothing — key_bias is not reaching the kernel \
+             (gap={gap:e})"
+        );
+    }
 }
 
 // ---- DeepSeek V4 Sinkhorn hyper-connections: `Op::HyperConnectMix` / `Pre` / `Post`

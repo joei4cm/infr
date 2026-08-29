@@ -574,6 +574,7 @@ mod tests {
             mask: AttnMask::Causal,
             pos: 0,
             sinks: None,
+            key_bias: None,
         });
 
         let ids = g.input(TensorDesc::new(vec![1], DType::I32));
@@ -3946,6 +3947,7 @@ impl MetalBackend {
                 mask,
                 pos,
                 sinks,
+                key_bias,
             } => {
                 let (rows, kv_len, nh, nkv, hd) = (
                     rows as usize,
@@ -4009,34 +4011,30 @@ impl MetalBackend {
                             .into(),
                     ));
                 }
-                // Per-head attention sinks (deepseek4, `Op::Attention::sinks`) live in exactly ONE
-                // kernel pair (`ATTN_SINKS_KERNEL` in attention.metal). None of the split / flash /
-                // vec / q8 tiers below knows about them, and a tier that quietly ignored the sink
-                // would produce a plausible softmax over the wrong denominator — so route here
-                // unconditionally and refuse the shapes this pair cannot serve.
-                if let Some(sk) = sinks {
+                // Per-head attention sinks (deepseek4, `Op::Attention::sinks`) and the CSA top-k
+                // score bias (`Op::Attention::key_bias`) live in exactly ONE kernel family
+                // (`ATTN_SINKS_KERNEL`/`ATTN_BIAS_KERNEL`/`ATTN_SINKS_BIAS_KERNEL` in
+                // attention.metal), combinable — DeepSeek V4's CSA layers carry both. None of the
+                // split / flash / vec / q8 tiers below knows about either, and a tier that quietly
+                // ignored one would produce a plausible softmax over the wrong denominator/scores
+                // — so route here unconditionally and refuse the shapes this family cannot serve.
+                if sinks.is_some() || key_bias.is_some() {
                     let (kdt, vdt) = (g.desc(k_cache).dtype, g.desc(v_cache).dtype);
                     if canvas_lo.is_some() || r.posbuf.is_some() {
                         return Err(Error::Unsupported(
-                            "metal attention: sinks under AttnMask::Canvas or on a decode-replay \
-                             tape have no kernel (the sinks pair is causal/SWA, static)"
+                            "metal attention: sinks/key_bias under AttnMask::Canvas or on a \
+                             decode-replay tape have no kernel (that family is causal/SWA, static)"
                                 .into(),
                         ));
                     }
                     if kdt != vdt || !matches!(kdt, DType::F32 | DType::F16) {
                         return Err(Error::Unsupported(format!(
-                            "metal attention: sinks need a coupled f32 or f16 KV cache, got \
-                             K={kdt:?} V={vdt:?} — the sinks kernels have no quant read and skip \
-                             the dequant prepass"
+                            "metal attention: sinks/key_bias need a coupled f32 or f16 KV cache, \
+                             got K={kdt:?} V={vdt:?} — that kernel family has no quant read and \
+                             skips the dequant prepass"
                         )));
                     }
-                    let bsk = self.weight_buf(sk, g, bindings)?;
-                    let kern = if kdt == DType::F16 {
-                        "attention_sinks_f16kv"
-                    } else {
-                        "attention_sinks_f32"
-                    };
-                    let pso = self.pipelines.get(kern)?;
+                    let f16kv = kdt == DType::F16;
                     let mut p = (rows as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(kv_len as u32).to_ne_bytes());
                     p.extend_from_slice(&(nh as u32).to_ne_bytes());
@@ -4045,16 +4043,72 @@ impl MetalBackend {
                     p.extend_from_slice(&scale.to_ne_bytes());
                     p.extend_from_slice(&window.to_ne_bytes());
                     p.extend_from_slice(&pos.to_ne_bytes());
-                    // One simdgroup per (query, head), like the sink-free `attention_*` pair.
-                    self.encode_tg_w(
-                        r,
-                        &pso,
-                        &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bsk.as_ref(), bd.as_ref()],
-                        1 << 4,
-                        &p,
-                        rows * nh * 32,
-                        32,
-                    );
+                    // One simdgroup per (query, head), like the sink/bias-free `attention_*` pair.
+                    match (sinks, key_bias) {
+                        (Some(sk), Some(kb)) => {
+                            let bsk = self.weight_buf(sk, g, bindings)?;
+                            let bkb = self.ensure_device(r, kb);
+                            let kern = if f16kv {
+                                "attention_sinks_bias_f16kv"
+                            } else {
+                                "attention_sinks_bias_f32"
+                            };
+                            let pso = self.pipelines.get(kern)?;
+                            self.encode_tg_w(
+                                r,
+                                &pso,
+                                &[
+                                    bq.as_ref(),
+                                    &kbuf.raw,
+                                    &vbuf.raw,
+                                    bsk.as_ref(),
+                                    bkb.as_ref(),
+                                    bd.as_ref(),
+                                ],
+                                1 << 5,
+                                &p,
+                                rows * nh * 32,
+                                32,
+                            );
+                        }
+                        (Some(sk), None) => {
+                            let bsk = self.weight_buf(sk, g, bindings)?;
+                            let kern = if f16kv {
+                                "attention_sinks_f16kv"
+                            } else {
+                                "attention_sinks_f32"
+                            };
+                            let pso = self.pipelines.get(kern)?;
+                            self.encode_tg_w(
+                                r,
+                                &pso,
+                                &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bsk.as_ref(), bd.as_ref()],
+                                1 << 4,
+                                &p,
+                                rows * nh * 32,
+                                32,
+                            );
+                        }
+                        (None, Some(kb)) => {
+                            let bkb = self.ensure_device(r, kb);
+                            let kern = if f16kv {
+                                "attention_bias_f16kv"
+                            } else {
+                                "attention_bias_f32"
+                            };
+                            let pso = self.pipelines.get(kern)?;
+                            self.encode_tg_w(
+                                r,
+                                &pso,
+                                &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bkb.as_ref(), bd.as_ref()],
+                                1 << 4,
+                                &p,
+                                rows * nh * 32,
+                                32,
+                            );
+                        }
+                        (None, None) => unreachable!("guarded by the outer sinks/key_bias check"),
+                    }
                     r.loc[dst.0 as usize] = Loc::Device;
                     return Ok(());
                 }

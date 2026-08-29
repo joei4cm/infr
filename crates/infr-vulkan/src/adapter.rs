@@ -213,16 +213,17 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
                 v_cache,
                 kv_len,
                 sinks,
+                key_bias,
                 ..
             } => {
                 has_attn = true;
                 if *rows != 1 || *head_dim % 4 != 0 || *head_dim > 512 {
                     return false;
                 }
-                // Attention sinks have ONE kernel (`attention_kv.comp`'s -DSINKS static build) and
-                // no params-driven `_dyn` twin, so a replayed tape would run the sink-free split-K
-                // family instead. Force static.
-                if sinks.is_some() {
+                // Attention sinks and key_bias have ONE kernel family (`attention_kv.comp`'s
+                // -DSINKS/-DBIAS static builds) and no params-driven `_dyn` twin, so a replayed
+                // tape would run the sink/bias-free split-K family instead. Force static.
+                if sinks.is_some() || key_bias.is_some() {
                     return false;
                 }
                 // Multi-position graph (see the comment above `attn_kv_len`): different kv_len across
@@ -2587,6 +2588,7 @@ fn lower_op(
             mask,
             pos,
             sinks,
+            key_bias,
         } => {
             let (rows, kv_len, nh, nkv, hd, pos) = (
                 *rows as usize,
@@ -2614,15 +2616,17 @@ fn lower_op(
             // kv_len (padded, for nonfa's 256-row tiles) outruns the rows actually present. On a
             // full-context cache kv_len <= att_cap_rows always, so none of these gates move.
             let att_cap_rows = cap / (nkv * hd).max(1);
-            // Per-head attention sinks (deepseek4, `Op::Attention::sinks`) live in exactly ONE
-            // kernel — `attention_kv.comp`'s -DSINKS build. Nothing else in the tier ladder below
-            // (flash, non-FA coopmat, split-K, the Q8/BDA/params twins) knows about them, and a
-            // tier that quietly ignored the sink would produce a correct-looking softmax over the
-            // wrong denominator. So a sinks op takes the scalar path unconditionally, and the
-            // shapes that path cannot serve are refused here rather than silently mis-served.
-            // `decode_eligible` already forces sinks graphs off the record-once replay tape.
-            if let Some(sk) = sinks {
-                // The scalar sinks build reads `q` and both caches as f16 (the seam's own
+            // Per-head attention sinks (deepseek4, `Op::Attention::sinks`) and the CSA top-k score
+            // bias (`Op::Attention::key_bias`) live in exactly ONE kernel family —
+            // `attention_kv.comp`'s -DSINKS/-DBIAS builds, combinable (deepseek4 CSA layers carry
+            // both). Nothing else in the tier ladder below (flash, non-FA coopmat, split-K, the
+            // Q8/BDA/params twins) knows about either, and a tier that quietly ignored one would
+            // produce a correct-looking softmax over the wrong denominator/scores. So either op
+            // takes the scalar path unconditionally, and the shapes that path cannot serve are
+            // refused here rather than silently mis-served. `decode_eligible` already forces
+            // sinks/key_bias graphs off the record-once replay tape.
+            if sinks.is_some() || key_bias.is_some() {
+                // The scalar sinks/bias builds read `q` and both caches as f16 (the seam's own
                 // producer→consumer dtype flow). Every other KV dtype reaches the tier ladder
                 // through the dequant→f16 prepass below, which this early return skips — so
                 // require f16 outright rather than hand the kernel bytes it will misread.
@@ -2631,8 +2635,8 @@ fn lower_op(
                 };
                 if !f16(*k_cache) || !f16(*v_cache) {
                     return Err(be(
-                        "vulkan adapter: Op::Attention with sinks needs an f16 K/V cache — the \
-                         sinks build (attention_kv_sinks) has no quant read and no dequant prepass",
+                        "vulkan adapter: Op::Attention with sinks/key_bias needs an f16 K/V cache \
+                         — that build has no quant read and no dequant prepass",
                     ));
                 }
                 let window = match mask {
@@ -2640,27 +2644,64 @@ fn lower_op(
                     AttnMask::SlidingWindow(w) => *w,
                     AttnMask::Canvas { .. } => {
                         return Err(be(
-                            "vulkan adapter: Op::Attention with sinks under AttnMask::Canvas has \
-                             no kernel — the scalar sinks path carries no bidirectional `lo`",
+                            "vulkan adapter: Op::Attention with sinks/key_bias under \
+                             AttnMask::Canvas has no kernel — the scalar path carries no \
+                             bidirectional `lo`",
                         ));
                     }
                 };
-                rec.attention_kv_sinks(
-                    r(*q)?,
-                    r(*k_cache)?,
-                    r(*v_cache)?,
-                    r(*sk)?,
-                    r(*dst)?,
-                    rows,
-                    kv_len,
-                    nh,
-                    nkv,
-                    hd,
-                    pos,
-                    window,
-                    *scale,
-                    cap,
-                );
+                match (sinks, key_bias) {
+                    (Some(sk), Some(kb)) => rec.attention_kv_sinks_bias(
+                        r(*q)?,
+                        r(*k_cache)?,
+                        r(*v_cache)?,
+                        r(*sk)?,
+                        r(*kb)?,
+                        r(*dst)?,
+                        rows,
+                        kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        pos,
+                        window,
+                        *scale,
+                        cap,
+                    ),
+                    (Some(sk), None) => rec.attention_kv_sinks(
+                        r(*q)?,
+                        r(*k_cache)?,
+                        r(*v_cache)?,
+                        r(*sk)?,
+                        r(*dst)?,
+                        rows,
+                        kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        pos,
+                        window,
+                        *scale,
+                        cap,
+                    ),
+                    (None, Some(kb)) => rec.attention_kv_bias(
+                        r(*q)?,
+                        r(*k_cache)?,
+                        r(*v_cache)?,
+                        r(*kb)?,
+                        r(*dst)?,
+                        rows,
+                        kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        pos,
+                        window,
+                        *scale,
+                        cap,
+                    ),
+                    (None, None) => unreachable!("guarded by the outer sinks/key_bias check"),
+                }
                 return Ok(());
             }
             if let RopeMode::Dynamic(params) = mode {
@@ -7422,6 +7463,7 @@ mod tests {
             mask: AttnMask::Causal,
             pos: pos as u32,
             sinks: None,
+            key_bias: None,
         });
         let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
         let kb = be_.alloc(kf.len(), BufferUsage::Activations).unwrap();
@@ -7924,6 +7966,7 @@ mod tests {
                 },
                 pos: pos as u32,
                 sinks: None,
+                key_bias: None,
             });
             let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
             let kb = be_.alloc(kf.len(), BufferUsage::Activations).unwrap();

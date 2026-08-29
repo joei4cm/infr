@@ -4842,6 +4842,114 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// [`Self::attention_kv`] plus an additive per-(row, key) score BIAS (`attention_kv.comp`'s
+    /// -DBIAS build, `Op::Attention::key_bias`): `bias[q_len, kv_len]` f32 binds at slot 3 (output
+    /// last at 4), added to each key's scaled score before the softmax max — deepseek4 CSA's top-k
+    /// mask. Same f16-KV-only, static, bound restriction as [`Self::attention_kv_sinks`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_bias(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        bias: &dyn Buffer,
+        o: &dyn Buffer,
+        q_len: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos_offset: usize,
+        window: usize,
+        scale: f32,
+        cap: usize,
+    ) {
+        let kern = self.be.kernel(
+            "attention_kv_bias",
+            crate::gemm::attention_kv_bias_spv(),
+            5,
+            36,
+        );
+        let mut push = [0u8; 36];
+        push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&scale.to_ne_bytes());
+        push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(q),
+                Self::vkb(kc),
+                Self::vkb(vc),
+                Self::vkb(bias),
+                Self::vkb(o),
+            ],
+            1,
+            &push,
+            (q_len * nh) as u32,
+        );
+    }
+
+    /// [`Self::attention_kv_sinks`] plus [`Self::attention_kv_bias`]'s score bias, both at once
+    /// (`attention_kv.comp`'s `-DSINKS -DBIAS` build) — DeepSeek V4's CSA layers, which carry
+    /// `attn_sinks` AND the lightning indexer's top-k mask on the SAME attention. `sinks[nh]` binds
+    /// at slot 3, `bias[q_len, kv_len]` at slot 4, output last at 5.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_sinks_bias(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        sinks: &dyn Buffer,
+        bias: &dyn Buffer,
+        o: &dyn Buffer,
+        q_len: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos_offset: usize,
+        window: usize,
+        scale: f32,
+        cap: usize,
+    ) {
+        let kern = self.be.kernel(
+            "attention_kv_sinks_bias",
+            crate::gemm::attention_kv_sinks_bias_spv(),
+            6,
+            36,
+        );
+        let mut push = [0u8; 36];
+        push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&scale.to_ne_bytes());
+        push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(q),
+                Self::vkb(kc),
+                Self::vkb(vc),
+                Self::vkb(sinks),
+                Self::vkb(bias),
+                Self::vkb(o),
+            ],
+            1,
+            &push,
+            (q_len * nh) as u32,
+        );
+    }
+
     /// `-DKV_BDA` twin of [`Self::attention_kv`] (#74 slice 1): reads the K/V cache by 64-bit device
     /// address (`k_addr`/`v_addr`, kv_addr.glsl) instead of the bound SSBOs at slots 1/2. Bit-
     /// identical to the bound build (proven by kv_addr_parity.rs); production forks here from

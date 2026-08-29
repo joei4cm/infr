@@ -139,6 +139,117 @@ kernel void NAME(device const float* q     [[buffer(0)]],                       
 ATTN_SINKS_KERNEL(attention_sinks_f32, float)
 ATTN_SINKS_KERNEL(attention_sinks_f16kv, half)
 
+// ---- Attention with an additive per-(row, key) score BIAS (Op::Attention::key_bias, deepseek4
+// CSA's top-k mask — Op::TopkMask's output). Same shape as attention_f32/attention_f16kv above,
+// plus `bias[q_len, kv_len]` added to each key's scaled score BEFORE the running max, indexed by
+// KEY POSITION `j` (this kernel carries no ring cache, same as the sinks pair above). `p.kv_len`
+// is the bias row stride.
+// The host routes EVERY key_bias op here (no split/flash/vec sibling knows about it); see
+// `Op::Attention::key_bias` and the exec arm's sinks/key_bias branch.
+#define ATTN_BIAS_KERNEL(NAME, KVT)                                                               \
+kernel void NAME(device const float* q    [[buffer(0)]],                                          \
+                 device const KVT*   k    [[buffer(1)]],                                          \
+                 device const KVT*   v    [[buffer(2)]],                                          \
+                 device const float* bias [[buffer(3)]],                                          \
+                 device float*       dst  [[buffer(4)]],                                          \
+                 constant AttnParams& p   [[buffer(5)]],                                          \
+                 uint gid  [[thread_position_in_grid]],                                            \
+                 uint lane [[thread_index_in_simdgroup]]) {                                        \
+    uint sg = gid / 32u;                                                                           \
+    if (sg >= p.rows * p.n_head) return;                                                           \
+    uint ti = sg / p.n_head;                                                                       \
+    uint h = sg % p.n_head;                                                                        \
+    uint group = p.n_head / p.n_kv;                                                                \
+    uint kvh = h / group;                                                                          \
+    uint qb = sg * p.head_dim;                                                                     \
+    uint abs = p.pos + ti;                                                                         \
+    uint lo = (p.window > 0u && abs + 1u > p.window) ? (abs + 1u - p.window) : 0u;                 \
+    float acc[MAX_DPL];                                                                            \
+    for (uint t = 0; t < MAX_DPL; t++) acc[t] = 0.0f;                                              \
+    float m = -INFINITY, l = 0.0f;                                                                 \
+    for (uint j = lo; j <= abs; j++) {                                                             \
+        uint kb = (j * p.n_kv + kvh) * p.head_dim;                                                 \
+        float part = 0.0f;                                                                         \
+        for (uint d = lane; d < p.head_dim; d += 32u) part += q[qb + d] * (float)k[kb + d];        \
+        float sc = simd_sum(part) * p.scale + bias[ti * p.kv_len + j];                             \
+        float mnew = max(m, sc);                                                                   \
+        /* A masked-out key carries sc == -INFINITY; when it is the FIRST key of the row, m is */  \
+        /* still the -INFINITY seed, so m - mnew is inf - inf == NaN and poisons l and acc for  */  \
+        /* the rest of the row. Only this online form can reach it: the CPU arm takes the row   */  \
+        /* max in a separate pass and Vulkan seeds its per-tile max at a finite -3.0e38. An     */  \
+        /* all-masked prefix weighs nothing, so carry acc forward (corr 1) and add none (pw 0). */  \
+        bool none_yet = (mnew == -INFINITY);                                                       \
+        float corr = none_yet ? 1.0f : exp(m - mnew);                                              \
+        float pw = none_yet ? 0.0f : exp(sc - mnew);                                               \
+        l = l * corr + pw;                                                                         \
+        uint vb = (j * p.n_kv + kvh) * p.head_dim;                                                 \
+        uint t = 0;                                                                                \
+        for (uint d = lane; d < p.head_dim; d += 32u) { acc[t] = acc[t] * corr + pw * (float)v[vb + d]; t++; } \
+        m = mnew;                                                                                  \
+    }                                                                                               \
+    uint t = 0;                                                                                    \
+    for (uint d = lane; d < p.head_dim; d += 32u) { dst[qb + d] = acc[t] / l; t++; }               \
+}
+ATTN_BIAS_KERNEL(attention_bias_f32, float)
+ATTN_BIAS_KERNEL(attention_bias_f16kv, half)
+
+// ---- Attention with BOTH sinks and the score bias (Op::Attention::sinks + key_bias, DeepSeek V4
+// CSA's exact shape: `attn_sinks` plus the lightning indexer's top-k mask on the same attention).
+// `ATTN_SINKS_KERNEL` plus `ATTN_BIAS_KERNEL`'s bias term, combined rather than composed as two
+// dispatches — the whole point of keeping both in one kernel family (see the field's doc).
+#define ATTN_SINKS_BIAS_KERNEL(NAME, KVT)                                                          \
+kernel void NAME(device const float* q     [[buffer(0)]],                                          \
+                 device const KVT*   k     [[buffer(1)]],                                          \
+                 device const KVT*   v     [[buffer(2)]],                                          \
+                 device const float* sinks [[buffer(3)]],                                          \
+                 device const float* bias  [[buffer(4)]],                                          \
+                 device float*       dst   [[buffer(5)]],                                          \
+                 constant AttnParams& p    [[buffer(6)]],                                          \
+                 uint gid  [[thread_position_in_grid]],                                            \
+                 uint lane [[thread_index_in_simdgroup]]) {                                        \
+    uint sg = gid / 32u;                                                                           \
+    if (sg >= p.rows * p.n_head) return;                                                           \
+    uint ti = sg / p.n_head;                                                                       \
+    uint h = sg % p.n_head;                                                                        \
+    uint group = p.n_head / p.n_kv;                                                                \
+    uint kvh = h / group;                                                                          \
+    uint qb = sg * p.head_dim;                                                                     \
+    uint abs = p.pos + ti;                                                                         \
+    uint lo = (p.window > 0u && abs + 1u > p.window) ? (abs + 1u - p.window) : 0u;                 \
+    float acc[MAX_DPL];                                                                            \
+    for (uint t = 0; t < MAX_DPL; t++) acc[t] = 0.0f;                                              \
+    float m = -INFINITY, l = 0.0f;                                                                 \
+    for (uint j = lo; j <= abs; j++) {                                                             \
+        uint kb = (j * p.n_kv + kvh) * p.head_dim;                                                 \
+        float part = 0.0f;                                                                         \
+        for (uint d = lane; d < p.head_dim; d += 32u) part += q[qb + d] * (float)k[kb + d];        \
+        float sc = simd_sum(part) * p.scale + bias[ti * p.kv_len + j];                             \
+        float mnew = max(m, sc);                                                                   \
+        /* A masked-out key carries sc == -INFINITY; when it is the FIRST key of the row, m is */  \
+        /* still the -INFINITY seed, so m - mnew is inf - inf == NaN and poisons l and acc for  */  \
+        /* the rest of the row. Only this online form can reach it: the CPU arm takes the row   */  \
+        /* max in a separate pass and Vulkan seeds its per-tile max at a finite -3.0e38. An     */  \
+        /* all-masked prefix weighs nothing, so carry acc forward (corr 1) and add none (pw 0). */  \
+        bool none_yet = (mnew == -INFINITY);                                                       \
+        float corr = none_yet ? 1.0f : exp(m - mnew);                                              \
+        float pw = none_yet ? 0.0f : exp(sc - mnew);                                               \
+        l = l * corr + pw;                                                                         \
+        uint vb = (j * p.n_kv + kvh) * p.head_dim;                                                 \
+        uint t = 0;                                                                                \
+        for (uint d = lane; d < p.head_dim; d += 32u) { acc[t] = acc[t] * corr + pw * (float)v[vb + d]; t++; } \
+        m = mnew;                                                                                  \
+    }                                                                                               \
+    float sk = sinks[h];                                                                           \
+    float mfin = max(m, sk);                                                                       \
+    float scorr = exp(m - mfin);                                                                   \
+    l = l * scorr + exp(sk - mfin);                                                                \
+    for (uint t = 0; t < MAX_DPL; t++) acc[t] *= scorr;                                            \
+    uint t = 0;                                                                                    \
+    for (uint d = lane; d < p.head_dim; d += 32u) { dst[qb + d] = acc[t] / l; t++; }               \
+}
+ATTN_SINKS_BIAS_KERNEL(attention_sinks_bias_f32, float)
+ATTN_SINKS_BIAS_KERNEL(attention_sinks_bias_f16kv, half)
+
 // ---- Split-KV ("flash-decode") attention: same math as attention_*, but NSG simdgroups per
 // (query, head) threadgroup, each running a private online softmax over a strided slice of the KV
 // positions, merged at the end through threadgroup memory (rescale each partial to the global max,

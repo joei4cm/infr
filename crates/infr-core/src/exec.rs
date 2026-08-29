@@ -202,6 +202,7 @@ mod tests {
             mask: AttnMask::Causal,
             pos: 0,
             sinks: None,
+            key_bias: None,
         });
         g.push(Op::RmsNorm {
             x: hidden,
