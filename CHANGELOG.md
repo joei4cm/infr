@@ -19,6 +19,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`infr` builds and runs natively on Windows** (thanks to
+  [@Headmaster218](https://github.com/Headmaster218), PR #91). `infr-hub` and
+  `infr-core` previously called `libc::flock`,
+  `std::os::unix::fs::FileExt::write_all_at` and `/proc/meminfo`
+  unconditionally, so the crates did not compile for a Windows target at all.
+  Each is now a `cfg(unix)` arm paired with a Windows one:
+  `LockFileEx`/`UnlockFileEx` for the blob-store lock, a `seek_write` retry loop
+  for ranged downloads (Windows' positional write can return short where
+  `write_all_at` cannot), a hard-link fallback in `link_blob`, and
+  `GlobalMemoryStatusEx` for available memory. Unix and macOS behaviour is
+  unchanged. **Caveat worth knowing before you rely on it:** no CI job builds or
+  tests a Windows target, and the one test covering the file lock is excluded
+  there, so these paths are reviewed but unexercised — see `docs/backlog.md` §
+  B66.
 - **`Op::CompressPool` — DeepSeek V4's compressor pooling — on CPU, Vulkan and
   Metal.** One op for the four ggml nodes both V4 compressor variants share
   (`build_hca_compressed_kv_from_state` and

@@ -691,10 +691,10 @@ with. And it does not bind the writer that actually matters:
 `cp new.gguf live.gguf` opens the destination `O_TRUNC` and takes no lock, nor
 does any editor, nor llama.cpp. Reusable machinery exists (`FileLock` in
 `pull.rs`) if this is ever revisited, and it should be taken SHARED — exclusive
-would stop two `infr` processes sharing one model. Windows is not the obstacle
-it first appeared: `FileLock` already calls `libc::flock` unconditionally, so
-`infr-hub` does not build there today and CI covers only ubuntu-26.04 and
-macos-15.
+would stop two `infr` processes sharing one model. `FileLock` is portable as of
+PR #91: the `libc::flock` call is now a `cfg(unix)` arm with a `LockFileEx`
+counterpart, so a revisit no longer has to solve Windows first. CI still builds
+only ubuntu-26.04 and macos-15 (§ B66).
 
 ### B31a — what the weekly miri job does NOT cover
 
@@ -1235,9 +1235,11 @@ one real 229 GB five-shard pull. Not covered:
   growing past `pull_jobs` lines. Five shards did not show it. If it turns out
   to matter, the lever is `MultiProgress::remove` / `finish_and_clear` on each
   completed bar, at the cost of the per-shard `✓` line.
-- **Windows and macOS.** `download.rs` calls `libc::flock` unconditionally, so
-  `infr-hub` does not build on Windows at all (B30 records the same); the
-  fan-out itself is `std::thread::scope` and portable. macOS is CI-only.
+- **Windows and macOS.** The fan-out itself is `std::thread::scope` and
+  portable. `infr-hub` builds on Windows as of PR #91, but nothing RUNS the
+  fan-out there — no CI job builds or tests that target, and the one test that
+  covered the lock is now `cfg(not(target_os = "windows"))` (§ B66). macOS is
+  CI-only.
 - **`HF_TOKEN` on a gated repo.** The token now reaches `download_to_blob` from
   inside rather than as a parameter; unchanged in effect, but no gated repo was
   pulled.
@@ -1287,9 +1289,12 @@ MB/s end to end, sha256 equal to HF's `lfs.oid`. Not covered:
   serialises them is unchanged and still unit-tested, and both modes take it
   from the same `.dl-…lock` name so a mode difference cannot dodge it. No test
   starts a second process.
-- **Windows.** `ranged::fetch_chunk` writes with `std::os::unix::fs::FileExt`,
-  so it is one more unix-only dependency in a crate that already does not build
-  there (B30).
+- **Windows.** `ranged::fetch_chunk`'s
+  `std::os::unix::fs::FileExt::write_all_at` is a `cfg(unix)` arm as of PR #91,
+  paired with a `seek_write` retry loop — Windows' positional write can be
+  partial where `write_all_at` cannot, so the two arms are not the same code and
+  only the unix one has ever run. Nothing exercises the Windows arm: no CI job
+  builds that target (§ B66).
 - **A gated repo over ranges.** The bearer token is attached to the probe and to
   every chunk request, but reqwest drops `Authorization` across the cross-origin
   redirect to the CDN (as it should — the CDN URL is pre-signed), and no gated
@@ -2615,3 +2620,81 @@ id. Worth closing anyway, per CLAUDE.md's "enforce a contract, don't document
 one": either request `robustBufferAccess` on the device, or clamp in-shader, or
 validate the id range host-side where the ids are uploaded. Say which, and why
 the other two were not chosen.
+
+### B66 — the CI matrix is one platform wide, and PR #91 made that a coverage hole (2026-08-30)
+
+**Tag:** PR#91 residual · **Blocked on:** nothing; runner minutes and a decision
+about which jobs are worth fanning out
+
+PR #91 (merged `c59f692`) added native Windows support: `cfg(windows)` arms for
+the `infr-hub` file lock (`LockFileEx`/`UnlockFileEx` against the existing
+`flock`), `ranged::fetch_chunk`'s positional write (`seek_write` retry loop
+against `write_all_at`), `link_blob`'s hard-link fallback, and
+`GlobalMemoryStatusEx` for `available_bytes`. **None of it is built or run by
+CI.** Every job in `.github/workflows/ci.yml` is `ubuntu-26.04` except
+`test-macos`, and that one is narrower than it looks.
+
+What is actually covered today, read off the workflow:
+
+| job           | runner       | what it runs                                               |
+| ------------- | ------------ | ---------------------------------------------------------- |
+| `fmt`         | ubuntu-26.04 | `cargo fmt --check`                                        |
+| `clippy`      | ubuntu-26.04 | `--workspace --all-targets --locked -D warnings`           |
+| `test`        | ubuntu-26.04 | `nextest run --workspace` + `cargo test --doc`             |
+| `cpu-goldens` | ubuntu-26.04 | `infr-llama` CPU goldens, real models                      |
+| `build`       | ubuntu-26.04 | `cargo build --release`                                    |
+| `metal-check` | ubuntu-26.04 | `cargo check -p infr-metal --target aarch64-apple-darwin`  |
+| `test-macos`  | macos-15     | `cargo build --workspace`, then `cargo test -p infr-metal` |
+
+Three distinct gaps fall out of that table, and they are worth separating
+because they cost different amounts to close:
+
+1. **No Windows runner at all.** Nothing compiles the `cfg(windows)` arms, so
+   the next edit to `store.rs`, `ranged.rs` or `mem.rs` breaks them silently —
+   the exact failure mode CLAUDE.md calls out, where "not supported here"
+   arrives as "passed". The cheapest fix is a cross-`cargo check` from the
+   existing Ubuntu runner, mirroring what `metal-check` already does for Apple:
+   `--target x86_64-pc-windows-msvc`, no Windows runner needed. Verified locally
+   during the PR review that this catches real drift — `main` before the PR had
+   11 compile errors for `x86_64-pc-windows-gnu`, the PR branch zero. Note
+   `msvc` needs `lib.exe` and so may need the `gnu` target instead on a Linux
+   host; `gnu` is what was actually exercised.
+2. **`clippy` and the test suite are Linux-only, so platform-gated code is
+   unlinted and untested on two of three platforms.** `clippy` never sees a
+   `cfg(windows)` or `cfg(target_os = "macos")` body. `test-macos` BUILDS the
+   workspace but only TESTS `-p infr-metal`, so `infr-hub`'s and `infr-core`'s
+   suites — the crates PR #91 changed — have never run on macOS either. A
+   `runs-on: ${{ matrix.os }}` fan-out over
+   `[ubuntu-26.04, macos-15, windows-2025]` for `clippy` and `test` is the real
+   fix; the open question is cost, since `test` is ~4 minutes on Linux and the
+   goldens job is ~37.
+3. **The one test covering the lock is excluded on the platform the new code was
+   written for.** `file_lock_is_exclusive` is now
+   `#[cfg(not(target_os = "windows"))]`, so the `LockFileEx` path has no test
+   anywhere. Whatever is done about the matrix, that test needs a Windows-shaped
+   equivalent — it is a two-process exclusion check, so it needs a real runner,
+   not a cross-check.
+
+**Also raised in the PR review and not addressed** (recorded so they are not
+re-derived):
+
+- **Hand-rolled FFI beside a dependency that already has it.** The PR adds the
+  `windows` crate to `infr-core` for `GlobalMemoryStatusEx`, then declares
+  `extern "system"` bindings and a `#[repr(C)]` `OVERLAPPED` by hand in
+  `infr-hub`. The transcription was checked against the documented layout and is
+  correct, so this is not a bug report — but a verified upstream definition
+  cannot drift and a hand-written ABI struct can. Deciding factor is whether a
+  second dependency edge on `infr-hub` is wanted; the contributor was asked and
+  has not answered.
+- **`available_bytes` is clamped on Linux and not on Windows.** The Linux arm
+  picks `MemAvailable` over `MemFree` and then clamps by the cgroup limit, with
+  a comment explaining that sizing an arena from the unclamped figure is an OOM
+  kill in a container. The Windows arm returns `ullAvailPhys` with no equivalent
+  — Job Objects are the rough analogue. Note `ullAvailPhys` does include the
+  standby list, so it is not simply the under-reporting figure it first looks
+  like; the asymmetry is the missing container clamp, not the counter choice.
+- **The doc rewrite dropped a caveat rather than updating it.** The removed text
+  pointed at B30 and said the behaviour "could not be verified on the machine
+  this was written on". Given that is still true of every Windows path here, a
+  note about what is unverified is worth more than the tidier sentence that
+  replaced it.
