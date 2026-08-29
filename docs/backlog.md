@@ -1389,10 +1389,10 @@ sizes are 32/64/256 and therefore already divide any legal `k` — so unlike the
 GEMV path there is no dtype (BF16/F16/F32) that can even express an off-grid
 row. Reaching it needs a hand-built synthetic tensor, which is precisely the
 hazard B39 was about, so this is a real gap and not a non-issue. The reason to
-stop was scope: each `matmul*\*` entry carries its own tiling constraints
-(`gemm.rs`'s `matmul_f16`already asserts`m,n %64 && k %32`) and several take `k`
-with different meanings, so a uniform guard needs its own read of the family
-rather than a mechanical sweep.
+stop was scope: each
+`matmul*\*` entry carries its own tiling constraints (`gemm.rs`'s `matmul_f16`already asserts`m,n
+%64 && k %32`) and several take `k` with different meanings, so a uniform guard
+needs its own read of the family rather than a mechanical sweep.
 
 **Not the same defect, checked while here:** `native_gemm.comp` (the coopmat
 prefill GEMM, the one path that DOES take BF16) steps
@@ -1417,10 +1417,44 @@ change.
 
 **Slice B — ratios 4 and 128.** Needs new ops, not just wiring:
 
-- Persistent **compressor state** buffers with the ring-update and commit plan
-  of `dsv4_build_comp_plan`, including the `[persistent | scratch | sentinel]`
-  gather layout and the two-contiguous-halves read order for the overlapping
-  compressors.
+- **The plan half of `dsv4_build_comp_plan` is ported (2026-08-30), the buffer
+  half is not.** `build_dsv4_comp_plan` in
+  `crates/infr-llama/src/seam/dsv4_plan.rs` is a pure Rust function — no graph
+  emission, no backend calls — that computes the same
+  `n_visible`/`n_kv`/`state_pos`/`state_read_idxs`/`state_write_idxs`/
+  `state_write_pos`/`state_persist_{src,dst}_idxs` vectors the reference does,
+  including the `[persistent | scratch | sentinel]` gather layout and the
+  two-contiguous-halves read order for the overlapping compressors. Covered by
+  literal-vector tests (not just lengths) and red/green fault injection on the
+  floor-vs-ceil, `n_kv` padding, overlap-halves-order, persist-dedup and
+  CSA-only-dummy traps. **Nothing calls it yet** — no persistent compressor
+  state buffers, no `Op::CompressPool` wiring, not referenced from `runner.rs`.
+  Narrower than the reference, deliberately:
+  - **Single stream only.** Takes an explicit `n_seqs` and refuses above `1`,
+    mirroring the reference's `n_stream <= 1 && ubatch.n_seqs_unq > 1` throw.
+    `dsv4_stream_offset`'s arithmetic (`0` whenever `n_stream <= 1`) is dropped
+    rather than carried as dead code.
+  - **No rollback/`n_rs_seq` planes** (`state_restore_*`/`state_snapshot_*`):
+    infr's V4 has no speculative-decode rollback consumer, so they are left off
+    the plan struct entirely rather than carried as vectors nobody fills.
+  - **No coupled-ubatch CSA branch** (`dsv4_ubatch_has_coupled`): only the
+    non-coupled dummy-block path is ported, since a single sequence is never
+    coupled.
+  - **No contiguity guard, because it cannot fire here.** The reference pads to
+    `ceil(max(1, ubatch.n_seq_tokens)/ratio)` blocks and refuses a sequence more
+    than one block short of that. For a single-stream cache —
+    `raw_per_seq == false && comp_per_seq == false`, infr's exact and only scope
+    — `llama_kv_cache_dsv4::init_batch` always splits with `split_simple`, whose
+    `ubatch_add(idxs, idxs.size(), false)` passes `n_seqs == n_tokens` and so
+    makes `n_seq_tokens = n_tokens/n_seqs` unconditionally `1`, whatever the
+    ubatch's token count. That block count is therefore the constant `1`: the
+    padding rule collapses to "an ubatch that commits nothing gets exactly one
+    dummy", and the refusal's `n_writes + 1 != n_blocks` is only reachable at
+    `n_writes == 0`, where it holds trivially. The port implements the collapsed
+    rule and omits the unreachable refusal. **A future multi-stream slice must
+    revisit this**, since `split_equal` does produce a real per-sequence token
+    count — that is the point at which `n_seq_tokens` has to become a parameter
+    rather than a constant.
 - **`Op::Attention` has no `key_bias` field.** `Op::TopkMask` exists and
   `Op::Mla` consumes it, but the CSA path needs a top-k mask on ordinary
   attention over a concatenated `[raw | compressed]` K, which has nowhere to go
