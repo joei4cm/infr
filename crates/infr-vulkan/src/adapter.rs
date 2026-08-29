@@ -7213,8 +7213,10 @@ mod tests {
         let mut y16 = vec![0u8; nh * hd * 2];
         be_.download(yb.as_ref(), &mut y16).unwrap();
         let got: Vec<f32> = y16
-            .chunks_exact(2)
-            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| half::f16::from_le_bytes(c).to_f32())
             .collect();
         for i in 0..nh * hd {
             assert!(
@@ -7244,8 +7246,10 @@ mod tests {
                 .collect()
         };
         let deq = |b: &[u8]| -> Vec<f32> {
-            b.chunks_exact(2)
-                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            b.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| half::f16::from_le_bytes(c).to_f32())
                 .collect()
         };
         let x_f32: Vec<f32> = (0..nh * hd).map(|i| i as f32 * 0.1 - 0.5).collect();
@@ -7332,8 +7336,10 @@ mod tests {
         let mut got16 = vec![0u8; n * 2];
         be_.download(yb.as_ref(), &mut got16).unwrap();
         let got: Vec<f32> = got16
-            .chunks_exact(2)
-            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| half::f16::from_le_bytes(c).to_f32())
             .collect();
         for i in 0..n {
             assert_eq!(
@@ -7361,8 +7367,10 @@ mod tests {
                 .collect()
         };
         let deq = |b: &[u8]| -> Vec<f32> {
-            b.chunks_exact(2)
-                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            b.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| half::f16::from_le_bytes(c).to_f32())
                 .collect()
         };
         let q: Vec<f32> = (0..nh * hd).map(|i| (i as f32 * 0.07).sin()).collect();
@@ -7596,8 +7604,10 @@ mod tests {
                 .collect()
         };
         let deq = |b: &[u8]| -> Vec<f32> {
-            b.chunks_exact(2)
-                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            b.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| half::f16::from_le_bytes(c).to_f32())
                 .collect()
         };
 
@@ -7828,8 +7838,10 @@ mod tests {
                 .collect()
         };
         let deq = |b: &[u8]| -> Vec<f32> {
-            b.chunks_exact(2)
-                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            b.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| half::f16::from_le_bytes(c).to_f32())
                 .collect()
         };
         // kv=300 exercises the per-row split grid; kv=8300 with rows >= 12 exercises the
