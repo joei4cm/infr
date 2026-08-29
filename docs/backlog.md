@@ -1348,8 +1348,12 @@ model. The sweep is what was NOT done: **29 call sites in
 `crates/infr-vulkan/src/recorder.rs` still call plain `dispatch` with a flat
 `div_ceil` grid**, and the elementwise ones scale with `rows * n_embd`, which is
 the same shape. `Recorder::hyper_post` is the clearest sibling — its grid is
-`ceil(rows*hc*n_embd / 64)`, over the limit at ordinary prefill widths on a
-hyper-connected model.
+`ceil(rows*hc*n_embd / 64)`, which at rows=512, hc=4, n_embd=7168 is 229,376
+workgroups against the guaranteed 65,535. It is LATENT rather than live: the
+emit is gated on `lw.hc`, which only deepseek4 carries, and no real V4 file
+reaches a forward pass yet (§ B-DSV4-REAL), while every V4 graph the tests build
+is `batch == 1`. So it becomes reachable exactly when slice B lands — which is
+the moment to fix it, not before.
 
 What is established: the pairing works, and the recovery is load-bearing. Both
 were shown by pinning `MAX_GROUP_COUNT_X` to `2`, re-running
@@ -1630,13 +1634,14 @@ fused, with the permutes folded into the indexing. What is left:
   justify it until there is a caller to profile. The CPU arm keeps two
   `n_embd`-wide scratch vectors per block, allocated inside the chunk closure —
   fine for a test, worth hoisting if it ever runs hot.
-- **Metal has never been executed.** No Apple hardware; `compress_pool_f32`
-  typechecks only in the sense that its Rust caller does
-  (`cargo check -p infr-metal --all-targets --target x86_64-apple-darwin`). MSL
-  is compiled on-device at runtime, so the macOS CI job is its first real
-  compile AND its first execution, and `crates/infr-metal/tests/parity.rs`'s
-  `#[ignore]`d `compress_pool_parity` /
-  `compress_pool_all_neg_inf_window_is_zero` are what will report it.
+- **Metal ran, and passed — so this is NOT a Metal gap.** No Apple hardware
+  here, but the `test-macos` CI job runs `cargo test -p infr-metal` with
+  `--include-ignored`, and run `33268167452` logged
+  `test compress_pool_parity ... ok` and
+  `test compress_pool_all_neg_inf_window_is_zero ... ok` on `macos-15`. That is
+  a real MSL compile and a real execution against CPU on a real device. Recorded
+  because the reflex on this arch has been to assume Metal is unverified; for
+  this op it is not.
 - **`maxerr`/`maxerr64` in `seam_op_parity.rs` silently swallow NaN** — they
   fold with `f32::max`/`f64::max`, which return the non-NaN operand, so an
   all-NaN output reduces to an error of `0.0` and reads as a perfect match. This

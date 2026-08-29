@@ -36,8 +36,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   like the two before it. Its Vulkan dispatch splits a wide grid
   (`Recorder::dispatch_wide`), because one thread per output element puts
   `blocks * n_embd` past the guaranteed `maxComputeWorkGroupCount[0]` at a real
-  V4 context length. Metal is written and typechecks but has never been executed
-  (no Apple hardware) — its parity test is `#[ignore]`d.
+  V4 context length. Metal is parity-tested too: its kernel is `#[ignore]`d
+  locally for want of Apple hardware, but the macOS CI job runs the ignored
+  tests, so `compress_pool_f32` compiled and matched CPU on a real device.
 - **DeepSeek V4's hash-routed MoE layers run, on CPU and Vulkan.** Such a layer
   takes its experts from an i32 `blk.N.ffn_gate_tid2eid`
   `[n_expert_used, n_vocab]` table indexed by TOKEN ID rather than from the
