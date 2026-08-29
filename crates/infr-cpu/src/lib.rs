@@ -3522,6 +3522,65 @@ impl Backend for CpuBackend {
                     });
                     vals[dst.0 as usize] = out;
                 }
+                Op::CompressPool {
+                    values,
+                    scores,
+                    dst,
+                    blocks,
+                    window,
+                    n_embd,
+                } => {
+                    let (blocks, window, ne) = (blocks as usize, window as usize, n_embd as usize);
+                    assert!(
+                        window >= 1 && ne >= 1,
+                        "cpu Op::CompressPool: window {window} / n_embd {ne} — a block pools at \
+                         least one row of at least one channel"
+                    );
+                    let vs = &vals[values.0 as usize];
+                    let ss = &vals[scores.0 as usize];
+                    let need = blocks * window * ne;
+                    assert!(
+                        vs.len() >= need && ss.len() >= need,
+                        "cpu Op::CompressPool: values {} / scores {} too small for blocks \
+                         {blocks}, window {window}, n_embd {ne} (needs {need})",
+                        vs.len(),
+                        ss.len(),
+                    );
+                    let mut out = vec![0f32; blocks * ne];
+                    // One chunk per block. Within it every pass walks the window rows in order and
+                    // the channels contiguously, so the softmax reduces over the STRIDED window
+                    // axis without ever transposing the slab — the two `ggml_cont`s the reference
+                    // pays for its permutes.
+                    self.pool().for_chunks_mut(&mut out, ne, 1, &|b, o| {
+                        let vb = &vs[b * window * ne..][..window * ne];
+                        let sb = &ss[b * window * ne..][..window * ne];
+                        let mut m = vec![f32::NEG_INFINITY; ne];
+                        for row in sb.chunks_exact(ne) {
+                            for (m, &s) in m.iter_mut().zip(row) {
+                                *m = m.max(s);
+                            }
+                        }
+                        let mut den = vec![0f32; ne];
+                        for (vr, sr) in vb.chunks_exact(ne).zip(sb.chunks_exact(ne)) {
+                            for (((o, d), (&m, &s)), &v) in o
+                                .iter_mut()
+                                .zip(den.iter_mut())
+                                .zip(m.iter().zip(sr))
+                                .zip(vr)
+                            {
+                                let e = (s - m).exp();
+                                *d += e;
+                                *o = v.mul_add(e, *o);
+                            }
+                        }
+                        for ((o, &d), &m) in o.iter_mut().zip(den.iter()).zip(m.iter()) {
+                            // An all-`-inf` window is `0/0` (`s - m` is `NaN` for every lane): the
+                            // op defines it as 0.0 on every backend — see `Op::CompressPool`.
+                            *o = if m == f32::NEG_INFINITY { 0.0 } else { *o / d };
+                        }
+                    });
+                    vals[dst.0 as usize] = out;
+                }
             }
             if let Some(t0) = __t0 {
                 let e = op_times

@@ -4774,6 +4774,29 @@ fn lower_op(
                 *n_embd,
             );
         }
+        Op::CompressPool {
+            values,
+            scores,
+            dst,
+            blocks,
+            window,
+            n_embd,
+        } => {
+            if *window < 1 || *n_embd < 1 {
+                return Err(be(format!(
+                    "vulkan Op::CompressPool: window {window} / n_embd {n_embd} — a block pools \
+                     at least one row of at least one channel"
+                )));
+            }
+            rec.compress_pool(
+                r(*values)?,
+                r(*scores)?,
+                r(*dst)?,
+                *blocks,
+                *window,
+                *n_embd,
+            );
+        }
     }
     Ok(())
 }

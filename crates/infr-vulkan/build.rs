@@ -551,6 +551,9 @@ fn main() {
         ("hyper_mix", "hyper_mix_gates", &["-DGATES"]),
         ("hyper_pre", "hyper_pre", &[]),
         ("hyper_post", "hyper_post", &[]),
+        // DeepSeek V4 compressor pooling (Op::CompressPool) — per-channel softmax over the window
+        // axis, then the weighted average.
+        ("compress_pool", "compress_pool", &[]),
         ("softmax", "softmax", &[]),
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).

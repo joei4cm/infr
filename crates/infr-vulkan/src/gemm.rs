@@ -2323,6 +2323,18 @@ pub(crate) fn hyper_post_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/hyper_post.spv"))))
 }
+/// SPIR-V for the DeepSeek V4 compressor pooling (`compress_pool.comp`, `Op::CompressPool`). Used
+/// by the recorder's `compress_pool`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn compress_pool_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/compress_pool.spv"
+        )))
+    })
+}
 /// SPIR-V for the 256-thread subgroup row-softmax (`y=softmax(x*scale)`). Used by the recorder's
 /// `softmax` (diffusion-gemma's in-graph self-conditioning).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

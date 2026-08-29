@@ -770,3 +770,40 @@ kernel void hyper_post_f32(device const float* x    [[buffer(0)]],
     }
     dst[i] = acc;
 }
+
+// `Op::CompressPool` (DeepSeek V4 compressor pooling): per channel, softmax `scores` over the
+// WINDOW axis — not over n_embd — then average `values` under those weights.
+//
+//   m        = max_w scores[b, w, c]
+//   dst[b,c] = (sum_w values[b, w, c]*exp(scores[b, w, c] - m)) / (sum_w exp(scores[b, w, c] - m))
+//
+// The max-subtract is what makes the `-inf` sentinel rows weigh exactly zero; a window that is
+// ENTIRELY `-inf` writes 0.0 (a deliberate deviation from ggml's NaN — see `Op::CompressPool`).
+// One thread per output element, each walking its own window.
+struct CompressPoolParams { uint window; uint n_embd; uint total; };
+
+kernel void compress_pool_f32(device const float* values [[buffer(0)]],
+                              device const float* scores [[buffer(1)]],
+                              device float*       dst    [[buffer(2)]],
+                              constant CompressPoolParams& p [[buffer(3)]],
+                              uint i [[thread_position_in_grid]]) {
+    if (i >= p.total) return;
+    uint b = i / p.n_embd;
+    uint c = i - b*p.n_embd;
+    uint base = b*p.window*p.n_embd + c;
+
+    float m = -INFINITY;
+    for (uint w = 0u; w < p.window; ++w) {
+        m = max(m, scores[base + w*p.n_embd]);
+    }
+    if (isinf(m) && m < 0.0f) { dst[i] = 0.0f; return; }
+
+    float acc = 0.0f;
+    float den = 0.0f;
+    for (uint w = 0u; w < p.window; ++w) {
+        float e = exp(scores[base + w*p.n_embd] - m);
+        den += e;
+        acc = fma(values[base + w*p.n_embd], e, acc);
+    }
+    dst[i] = acc / den;
+}

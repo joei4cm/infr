@@ -1153,12 +1153,47 @@ current-window indices (lines 565-572) — which is exactly how
 (`deepseek4.cpp:463-489`). Getting that concatenation order wrong swaps the two
 halves of every pooling window and still runs.
 
-The pooling itself (`deepseek4.cpp:407-413`, and the same four lines in the HCA
-variant) is **per-channel softmax over the block axis**, not over the feature
-axis: values and scores are both permuted so the block index becomes the fast
-axis, `soft_max` runs, and `sum_rows` collapses it. Then RMS-norm by
-`attn_comp_norm`, rope the `[nope | rope]` tail at `compress_rope_base`, and
-write.
+The pooling itself (the same four lines in
+`build_overlap_compressed_kv_from_state` and in the HCA variant) is
+**per-channel softmax over the WINDOW axis** — the `ratio` (or `2*ratio`) cached
+rows a block pools — not over the feature axis: values and scores are both
+permuted so the window index becomes the fast axis, `soft_max` runs, and
+`sum_rows` collapses it. Then RMS-norm by `attn_comp_norm`, rope the
+`[nope | rope]` tail at `compress_rope_base`, and write.
+
+#### ✓ LANDED at the op level (2026-08-13) — nothing emits it yet
+
+`Op::CompressPool` on CPU + Vulkan + Metal, one op for the four ggml nodes both
+compressor variants share once their gathers have diverged (the pair of
+`ggml_permute`+`ggml_cont`s, the `soft_max`, the `mul` and the `sum_rows`).
+`values`/`scores` arrive `[blocks, window, n_embd]` and the permutes are folded
+into the op's indexing, so infr pays none of the reference's two `ggml_cont`s of
+the full permuted tensor. `window` is the op's name for what is `DSV4_HCA_RATIO`
+on an HCA layer and `2*ratio` on the overlapping CSA/LID one, which is why one
+op serves both.
+
+Verified in `seam_op_parity.rs`'s `compress_pool_*` against a from-definition
+f64 reference over windows 4 / 8 / 128, `blocks` 1 and >1, and an `n_embd` that
+is not a multiple of a workgroup. Four deviations were injected into the CPU arm
+and shown to go red; two are worth carrying forward:
+
+- **Softmaxing the feature axis runs and looks fine.** It stays finite, keeps
+  the output shape and lands in the right order of magnitude — it moved the
+  answer by ~14× the output scale, but nothing downstream would have said so.
+  This is the whole reason the pooling is one op rather than four generic ones.
+- **The `-inf` sentinel does NOT by itself expose a missing max-subtract.**
+  `exp(-inf)` is exactly `0.0`, so the naive `exp(s)/Σexp(s)` is algebraically
+  the same answer on a window with SOME sentinel lanes. It breaks in exactly two
+  places, and both are now test cases: scores large enough for `exp` to overflow
+  f32, and a window that is ENTIRELY `-inf`.
+
+That last case is `0/0`. **infr writes `0.0`; ggml produces `NaN`** — its
+`ggml_vec_soft_max_f32` computes `exp(-inf − -inf)` and scales by `1/NaN`,
+caught only by an `assert(sum > 0.0)` that release builds compile out. The
+deviation is deliberate: zero is the value the sentinel's own zero `values` make
+meaningful, a NaN cannot be told from a real defect once it has spread, and
+three backends can be tested to agree on `0.0` where `NaN != NaN` makes a parity
+assertion vacuous.
 
 #### The four boundary conditions
 

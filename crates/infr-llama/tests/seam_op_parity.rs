@@ -5021,3 +5021,405 @@ fn gather_i32_hash_selection_parity() {
         );
     }
 }
+
+// ── DeepSeek V4 compressor pooling (`Op::CompressPool`, docs/deepseek.md § "The compressed-KV
+// state machine"). The four ggml nodes both compressor variants share, fused into one op. ──
+
+/// One `Op::CompressPool` case.
+#[derive(Clone, Copy)]
+struct CpDims {
+    blocks: usize,
+    /// Rows pooled per block — `DSV4_HCA_RATIO` (128) for HCA, `2*ratio` (8, 4) for the
+    /// overlapping CSA/LID compressor.
+    window: usize,
+    n_embd: usize,
+    /// Leading window slots of block 0 that are `-inf` sentinel rows; block `b` gets
+    /// `sentinels - b` of them, so the table mixes blocks that have some with blocks that have
+    /// none (which is what the state gather produces for early blocks).
+    sentinels: usize,
+    /// Scores spread wide enough that `exp(score)` overflows f32 — the case that makes a dropped
+    /// max-subtract a NaN rather than an algebraic no-op.
+    wide: bool,
+}
+
+impl CpDims {
+    /// Sentinel rows in block `b`, never the whole window (an all-`-inf` window is its own test).
+    fn sentinels_in(&self, b: usize) -> usize {
+        self.sentinels.saturating_sub(b).min(self.window - 1)
+    }
+}
+
+/// Window 4 / 8 (the overlapping compressor's `2*ratio`) and 128 (HCA's `DSV4_HCA_RATIO`);
+/// `blocks` 1 and >1; `n_embd` deliberately not a multiple of the 64-lane Vulkan workgroup on
+/// every case but one; sentinels present on some blocks and absent on others.
+fn cp_cases() -> Vec<(&'static str, CpDims)> {
+    vec![
+        (
+            "hca window=128, 3 blocks, n_embd=5",
+            CpDims {
+                blocks: 3,
+                window: 128,
+                n_embd: 5,
+                sentinels: 0,
+                wide: false,
+            },
+        ),
+        (
+            "csa window=8 (2*ratio), 1 block, n_embd=129",
+            CpDims {
+                blocks: 1,
+                window: 8,
+                n_embd: 129,
+                sentinels: 0,
+                wide: false,
+            },
+        ),
+        (
+            "window=4, 5 blocks, sentinels on the first three",
+            CpDims {
+                blocks: 5,
+                window: 4,
+                n_embd: 7,
+                sentinels: 3,
+                wide: false,
+            },
+        ),
+        (
+            "window=8, 2 blocks, sentinels, n_embd=64 (exactly one workgroup)",
+            CpDims {
+                blocks: 2,
+                window: 8,
+                n_embd: 64,
+                sentinels: 5,
+                wide: false,
+            },
+        ),
+        (
+            "wide scores (exp overflows f32 without the max-subtract)",
+            CpDims {
+                blocks: 2,
+                window: 4,
+                n_embd: 33,
+                sentinels: 1,
+                wide: true,
+            },
+        ),
+    ]
+}
+
+/// `values` for a case. Sentinel slots get a LARGE magnitude rather than the zero row llama.cpp's
+/// `dsv4_append_zero_row` actually writes: their softmax weight has to be exactly zero, and a
+/// zero value would hide any leak behind its own zero.
+fn cp_values(d: CpDims) -> Vec<f32> {
+    let mut v: Vec<f32> = (0..d.blocks * d.window * d.n_embd)
+        .map(|i| (((i * 29 + 7) % 41) as f32 - 20.0) * 0.17)
+        .collect();
+    for b in 0..d.blocks {
+        for w in 0..d.sentinels_in(b) {
+            for (c, o) in v[(b * d.window + w) * d.n_embd..][..d.n_embd]
+                .iter_mut()
+                .enumerate()
+            {
+                *o = 1e4 * (c as f32 + 1.0);
+            }
+        }
+    }
+    v
+}
+
+/// `scores` for a case: mixed sign, no symmetry between the window and channel axes (a score
+/// constant along either would hide a softmax reducing over the wrong one), with the sentinel rows
+/// set to `-INFINITY` across every channel the way `dsv4_append_zero_row(…, true)` writes them.
+fn cp_scores(d: CpDims) -> Vec<f32> {
+    let amp = if d.wide { 12.0 } else { 0.3 };
+    let mut s: Vec<f32> = (0..d.blocks * d.window * d.n_embd)
+        .map(|i| (((i * 23 + 5) % 37) as f32 - 18.0) * amp)
+        .collect();
+    for b in 0..d.blocks {
+        for w in 0..d.sentinels_in(b) {
+            s[(b * d.window + w) * d.n_embd..][..d.n_embd].fill(f32::NEG_INFINITY);
+        }
+    }
+    s
+}
+
+/// A way of getting `Op::CompressPool` wrong that still runs and still produces the right SHAPE.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CpVariant {
+    Faithful,
+    /// Softmax over the FEATURE axis (`n_embd`) instead of the window axis — what you get by
+    /// dropping the reference's pair of `ggml_permute`s around the `ggml_soft_max`.
+    FeatureAxisSoftmax,
+    /// `exp(s)/Σexp(s)` with no max-subtract, in f32 as a kernel would compute it.
+    NoMaxSubtract,
+    /// `values` and `scores` read at each other's bindings.
+    SwapValuesScores,
+    /// Window stride `n_embd + 1` instead of `n_embd`, wrapped inside the block's own slab.
+    StrideOffByOne,
+}
+
+/// From-definition f64 reference, written from `Op::CompressPool`'s formula rather than by calling
+/// anything the kernels call. `Faithful` is the op; the other variants are the ways of getting it
+/// wrong that `compress_pool_details_are_load_bearing` shows this case table can see.
+fn cp_ref(values: &[f32], scores: &[f32], d: CpDims, v: CpVariant) -> Vec<f64> {
+    let (nb, nw, ne) = (d.blocks, d.window, d.n_embd);
+    let (values, scores) = if v == CpVariant::SwapValuesScores {
+        (scores, values)
+    } else {
+        (values, scores)
+    };
+    let slab = nw * ne;
+    let at = |b: usize, w: usize, c: usize| -> usize {
+        let off = if v == CpVariant::StrideOffByOne {
+            (w * (ne + 1) + c) % slab
+        } else {
+            w * ne + c
+        };
+        b * slab + off
+    };
+    let mut out = vec![0f64; nb * ne];
+    for b in 0..nb {
+        if v == CpVariant::FeatureAxisSoftmax {
+            for w in 0..nw {
+                let m = (0..ne)
+                    .map(|c| scores[at(b, w, c)])
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let e = |c: usize| ((scores[at(b, w, c)] - m) as f64).exp();
+                let den: f64 = (0..ne).map(e).sum();
+                for c in 0..ne {
+                    out[b * ne + c] += values[at(b, w, c)] as f64 * e(c) / den;
+                }
+            }
+            continue;
+        }
+        for c in 0..ne {
+            if v == CpVariant::NoMaxSubtract {
+                let e = |w: usize| scores[at(b, w, c)].exp() as f64;
+                let num: f64 = (0..nw).map(|w| values[at(b, w, c)] as f64 * e(w)).sum();
+                let den: f64 = (0..nw).map(e).sum();
+                out[b * ne + c] = num / den;
+                continue;
+            }
+            let m = (0..nw)
+                .map(|w| scores[at(b, w, c)])
+                .fold(f32::NEG_INFINITY, f32::max);
+            if m == f32::NEG_INFINITY {
+                // The all-`-inf` window: `Op::CompressPool` defines it as 0.0 on every backend.
+                out[b * ne + c] = 0.0;
+                continue;
+            }
+            let e = |w: usize| ((scores[at(b, w, c)] - m) as f64).exp();
+            let num: f64 = (0..nw).map(|w| values[at(b, w, c)] as f64 * e(w)).sum();
+            let den: f64 = (0..nw).map(e).sum();
+            out[b * ne + c] = num / den;
+        }
+    }
+    out
+}
+
+/// Build + run one `Op::CompressPool` on `be`.
+fn cp_run(be: &dyn Backend, values: &[f32], scores: &[f32], d: CpDims) -> Vec<f32> {
+    let mut g = Graph::new();
+    let vi = g.input(f32d(d.blocks * d.window * d.n_embd));
+    let si = g.input(f32d(d.blocks * d.window * d.n_embd));
+    let dst = g.output(f32d(d.blocks * d.n_embd));
+    g.push(Op::CompressPool {
+        values: vi,
+        scores: si,
+        dst,
+        blocks: d.blocks as u32,
+        window: d.window as u32,
+        n_embd: d.n_embd as u32,
+    });
+    run(
+        be,
+        &g,
+        &[(vi, values), (si, scores)],
+        &[],
+        dst,
+        d.blocks * d.n_embd,
+    )
+}
+
+/// How far apart two references are, counting any non-finite element as infinitely far. A wrong
+/// variant here can produce NaN (`0/0` from a dropped max-subtract, `inf/inf` from an overflowed
+/// one), and `NaN > bound` is false — without this a NaN variant would read as "did not move".
+fn cp_moved(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| {
+            if x.is_finite() && y.is_finite() {
+                (x - y).abs()
+            } else {
+                f64::INFINITY
+            }
+        })
+        .fold(0.0, f64::max)
+}
+
+/// Tolerance for every `Op::CompressPool` comparison, relative to `max(|out|, 1)`. The output is a
+/// convex average of `values`, so it is bounded by them; the only transcendental is one `exp` per
+/// lane, which a GPU is allowed ~3 ULP on, and the denominator is `>= 1` by construction (the max
+/// lane contributes exactly `exp(0)`), so nothing here cancels. `1e-5` sits well above that floor
+/// and far below the smallest deviation `compress_pool_details_are_load_bearing` measures.
+const CP_TOL: f64 = 1e-5;
+
+/// Every element of a `CompressPool` output must be FINITE, and no error metric in this file can
+/// say so: `maxerr`/`maxerr64` fold with `f32::max`/`f64::max`, which return the non-NaN operand,
+/// so a row of NaNs reduces to an error of `0.0` and reads as a perfect match. Every case here has
+/// at least one non-sentinel lane in every window (`CpDims::sentinels_in` caps at `window - 1`),
+/// so a finite result is guaranteed and a NaN means a defect — this is what makes a kernel that
+/// dropped the max-subtract go red on the wide-score case rather than silently pass.
+fn cp_assert_finite(what: &str, o: &[f32]) {
+    if let Some((i, v)) = o.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+        panic!("{what}: element {i} is {v}, not a finite pooled average");
+    }
+}
+
+/// `Op::CompressPool` — CPU vs the from-definition f64 reference, plus CPU-vs-Vulkan.
+#[test]
+fn compress_pool_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    for (name, d) in cp_cases() {
+        let values = cp_values(d);
+        let scores = cp_scores(d);
+        let want = cp_ref(&values, &scores, d, CpVariant::Faithful);
+        let c = cp_run(&cpu, &values, &scores, d);
+        cp_assert_finite(&format!("{name}: cpu"), &c);
+        let scale_of = want.iter().fold(0f64, |m, v| m.max(v.abs())).max(1.0);
+        let e = maxerr64(&c, &want) / scale_of;
+        println!("CompressPool {name}: cpu vs ref rel={e:e} (|out|max={scale_of:e})");
+        assert!(
+            e < CP_TOL,
+            "{name}: CompressPool diverges from the reference ({e:e})"
+        );
+        if let Some(vk) = gpu() {
+            let v = cp_run(&vk, &values, &scores, d);
+            cp_assert_finite(&format!("{name}: vulkan"), &v);
+            let e = maxerr(&v, &c) as f64 / scale_of;
+            println!("CompressPool {name}: vulkan vs cpu rel={e:e}");
+            assert!(
+                e < CP_TOL,
+                "{name}: Vulkan CompressPool diverges from CPU ({e:e})"
+            );
+        }
+    }
+}
+
+/// Each way of getting the op wrong, shown to CHANGE the answer. Without this,
+/// `compress_pool_parity` would keep passing against a reference that shared the same defect — and
+/// the first of these (softmaxing the feature axis) is precisely the one that runs, produces
+/// finite plausibly-scaled output, and is wrong.
+///
+/// The bound is `1e-3`, two orders above `CP_TOL`. A `NaN`/`inf` variant counts as an infinite
+/// move (see `cp_moved`).
+///
+/// **Dropping the max-subtract is the one deviation that is not detectable everywhere, and it is
+/// asserted INERT where it cannot be seen rather than skipped.** `exp(-inf)` is exactly `0.0` in
+/// IEEE, so on a window with SOME sentinel lanes the naive `exp(s)/Σexp(s)` is algebraically the
+/// same answer — the sentinel alone does not expose it, which is the opposite of what the shape of
+/// the code suggests. It becomes visible in exactly two places, and both are covered: the
+/// `wide` case here, where `exp(score)` overflows f32 to `inf` and the ratio goes NaN, and
+/// `compress_pool_all_neg_inf_window_is_zero`, where the naive form is `0/0` and a backend that
+/// took it would return NaN instead of the required exact zero.
+#[test]
+fn compress_pool_details_are_load_bearing() {
+    for (name, d) in cp_cases() {
+        let values = cp_values(d);
+        let scores = cp_scores(d);
+        let want = cp_ref(&values, &scores, d, CpVariant::Faithful);
+        let scale_of = want.iter().fold(0f64, |m, v| m.max(v.abs())).max(1.0);
+        let moved = |what: &str, v: CpVariant| -> f64 {
+            let e = cp_moved(&want, &cp_ref(&values, &scores, d, v)) / scale_of;
+            println!("CompressPool {name}: {what} moves the answer by rel={e:e}");
+            e
+        };
+        for (what, v) in [
+            (
+                "softmax over the feature axis",
+                CpVariant::FeatureAxisSoftmax,
+            ),
+            ("values and scores swapped", CpVariant::SwapValuesScores),
+            ("window stride n_embd+1", CpVariant::StrideOffByOne),
+        ] {
+            let e = moved(what, v);
+            assert!(
+                e > 1e-3,
+                "{name}: {what} changed the answer by only {e:e} — this case cannot detect it"
+            );
+        }
+        let e = moved("dropping the max-subtract", CpVariant::NoMaxSubtract);
+        if d.wide {
+            assert!(
+                e > 1e-3,
+                "{name}: dropping the max-subtract changed the answer by only {e:e} — the scores \
+                 are meant to overflow f32's exp here"
+            );
+        } else {
+            assert!(
+                e < CP_TOL,
+                "{name}: dropping the max-subtract was expected to be algebraically inert on \
+                 finite moderate scores (exp(-inf) is exactly 0), but it moved the answer by \
+                 {e:e} — re-read which case is supposed to expose it"
+            );
+        }
+    }
+}
+
+/// The all-`-inf` window, which is `0/0`: `Op::CompressPool` defines it as `0.0` on every backend,
+/// a deliberate deviation from ggml (`ggml_vec_soft_max_f32` computes `exp(-inf − -inf)` = NaN and
+/// scales the row by `1/NaN`). Asserted as an EXACT zero, and asserted on both backends together —
+/// the point of picking a value over NaN is that the backends can be shown to agree, which
+/// `NaN != NaN` would make impossible.
+///
+/// The block table mixes a fully-sentinel block with an ordinary one, so this also pins that the
+/// zero is per (block, channel) and does not leak into the neighbouring block's real average.
+#[test]
+fn compress_pool_all_neg_inf_window_is_zero() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let d = CpDims {
+        blocks: 3,
+        window: 6,
+        n_embd: 70,
+        sentinels: 0,
+        wide: false,
+    };
+    let values = cp_values(d);
+    let mut scores = cp_scores(d);
+    // Blocks 0 and 2 are entirely sentinel; block 1 keeps its real scores.
+    for b in [0usize, 2] {
+        scores[b * d.window * d.n_embd..][..d.window * d.n_embd].fill(f32::NEG_INFINITY);
+    }
+    let want = cp_ref(&values, &scores, d, CpVariant::Faithful);
+    let mid = &want[d.n_embd..][..d.n_embd];
+    assert!(
+        mid.iter().any(|v| v.abs() > 1e-2),
+        "the surviving block must carry a real average, or the zeros below prove nothing"
+    );
+
+    let mut outs = vec![("cpu", cp_run(&cpu, &values, &scores, d))];
+    if let Some(vk) = gpu() {
+        outs.push(("vulkan", cp_run(&vk, &values, &scores, d)));
+    }
+    for (be, o) in &outs {
+        cp_assert_finite(&format!("all-(-inf): {be}"), o);
+        for b in [0usize, 2] {
+            let row = &o[b * d.n_embd..][..d.n_embd];
+            println!(
+                "CompressPool all-(-inf) block {b} on {be}: max|out|={:e}",
+                row.iter().fold(0f32, |m, v| m.max(v.abs()))
+            );
+            assert!(
+                row.iter().all(|v| *v == 0.0),
+                "{be}: an all-(-inf) window must pool to exactly 0.0, got {row:?}"
+            );
+        }
+        let e = maxerr64(&o[d.n_embd..][..d.n_embd], mid)
+            / mid.iter().fold(1f64, |m, v| m.max(v.abs()));
+        println!("CompressPool all-(-inf) neighbour block on {be}: rel={e:e}");
+        assert!(
+            e < CP_TOL,
+            "{be}: the sentinel blocks disturbed the neighbouring block's average ({e:e})"
+        );
+    }
+}

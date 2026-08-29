@@ -19,6 +19,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`Op::CompressPool` — DeepSeek V4's compressor pooling — on CPU, Vulkan and
+  Metal.** One op for the four ggml nodes both V4 compressor variants share
+  (`build_hca_compressed_kv_from_state` and
+  `build_overlap_compressed_kv_from_state` differ only in their gathers): a
+  softmax-weighted average that collapses a `window` of cached KV rows into one
+  compressed row. The softmax runs **per channel over the window axis**, which
+  the reference buys with a pair of `ggml_permute` + `ggml_cont` around its
+  `ggml_soft_max`; here both permutes are folded into the op's indexing, so
+  nothing is materialised. The max-subtract form is required, not an
+  optimisation: the overlapping compressor pads short windows with an
+  `-INFINITY` sentinel row, and those lanes must weigh exactly zero. A window
+  that is entirely `-inf` is `0/0` and every backend writes `0.0` — a deliberate
+  deviation from ggml, which propagates `NaN` there (see `Op::CompressPool`'s
+  doc for why). Nothing emits this op yet; it is the third V4 op-level slice,
+  like the two before it. Its Vulkan dispatch splits a wide grid
+  (`Recorder::dispatch_wide`), because one thread per output element puts
+  `blocks * n_embd` past the guaranteed `maxComputeWorkGroupCount[0]` at a real
+  V4 context length. Metal is written and typechecks but has never been executed
+  (no Apple hardware) — its parity test is `#[ignore]`d.
 - **DeepSeek V4's hash-routed MoE layers run, on CPU and Vulkan.** Such a layer
   takes its experts from an i32 `blk.N.ffn_gate_tid2eid`
   `[n_expert_used, n_vocab]` table indexed by TOKEN ID rather than from the

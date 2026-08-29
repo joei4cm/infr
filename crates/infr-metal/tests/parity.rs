@@ -5166,3 +5166,150 @@ fn moe_ffn_hash_routing_parity() {
     ];
     assert_parity(&g, &bound, dst, rows * ne, 1e-3);
 }
+
+// ---- DeepSeek V4 compressor pooling: `Op::CompressPool` (`compress_pool_f32`).
+//
+// The cases mirror `infr-llama`'s `cp_cases()` case for case — same generators, same axes (HCA's
+// `window = 128`; the overlapping compressor's `2*ratio` = 8 and 4; `blocks = 1` and `blocks > 1`;
+// an `n_embd` that is not a multiple of the threadgroup width; `-inf` sentinel rows on some blocks
+// and not others; a wide-score case where a dropped max-subtract overflows `exp`). That test is
+// where the semantics are pinned against a from-definition f64 reference and where each way of
+// getting the op wrong is shown to change the answer; this one only asks whether the Metal kernel
+// reproduces the CPU oracle.
+
+/// One pooling case: `(name, blocks, window, n_embd, sentinels, wide)`.
+type CpCase = (&'static str, usize, usize, usize, usize, bool);
+
+const CP_CASES: [CpCase; 5] = [
+    ("hca window=128, 3 blocks, n_embd=5", 3, 128, 5, 0, false),
+    (
+        "csa window=8 (2*ratio), 1 block, n_embd=129",
+        1,
+        8,
+        129,
+        0,
+        false,
+    ),
+    (
+        "window=4, 5 blocks, sentinels on the first three",
+        5,
+        4,
+        7,
+        3,
+        false,
+    ),
+    (
+        "window=8, 2 blocks, sentinels, n_embd=64 (exactly one threadgroup)",
+        2,
+        8,
+        64,
+        5,
+        false,
+    ),
+    (
+        "wide scores (exp overflows f32 without the max-subtract)",
+        2,
+        4,
+        33,
+        1,
+        true,
+    ),
+];
+
+/// Sentinel rows in block `b` — never the whole window, which is `compress_pool_all_neg_inf_*`'s
+/// case instead.
+fn cp_sentinels_in(sentinels: usize, window: usize, b: usize) -> usize {
+    sentinels.saturating_sub(b).min(window - 1)
+}
+
+/// `values`/`scores` for a case, generated exactly as `infr-llama`'s `cp_values`/`cp_scores` do.
+/// Sentinel slots carry a LARGE value under their `-inf` score: the weight must be exactly zero,
+/// and llama.cpp's own zero row would hide a leak behind its own zero.
+fn cp_inputs(c: CpCase) -> (Vec<f32>, Vec<f32>) {
+    let (_, blocks, window, ne, sentinels, wide) = c;
+    let n = blocks * window * ne;
+    let mut values: Vec<f32> = (0..n)
+        .map(|i| (((i * 29 + 7) % 41) as f32 - 20.0) * 0.17)
+        .collect();
+    let amp = if wide { 12.0 } else { 0.3 };
+    let mut scores: Vec<f32> = (0..n)
+        .map(|i| (((i * 23 + 5) % 37) as f32 - 18.0) * amp)
+        .collect();
+    for b in 0..blocks {
+        for w in 0..cp_sentinels_in(sentinels, window, b) {
+            for (k, o) in values[(b * window + w) * ne..][..ne].iter_mut().enumerate() {
+                *o = 1e4 * (k as f32 + 1.0);
+            }
+            scores[(b * window + w) * ne..][..ne].fill(f32::NEG_INFINITY);
+        }
+    }
+    (values, scores)
+}
+
+fn cp_graph(c: CpCase) -> (Graph, TensorId, TensorId, TensorId) {
+    let (_, blocks, window, ne, _, _) = c;
+    let mut g = Graph::new();
+    let vi = g.input(TensorDesc::new(vec![blocks * window * ne], DType::F32));
+    let si = g.input(TensorDesc::new(vec![blocks * window * ne], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![blocks * ne], DType::F32));
+    g.push(Op::CompressPool {
+        values: vi,
+        scores: si,
+        dst,
+        blocks: blocks as u32,
+        window: window as u32,
+        n_embd: ne as u32,
+    });
+    (g, vi, si, dst)
+}
+
+/// `Op::CompressPool` — Metal vs CPU.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn compress_pool_parity() {
+    for c in CP_CASES {
+        let (name, blocks, _, ne, _, _) = c;
+        let (values, scores) = cp_inputs(c);
+        let (g, vi, si, dst) = cp_graph(c);
+        println!("CompressPool metal case: {name}");
+        assert_parity(
+            &g,
+            &[(vi, f32_bytes(&values)), (si, f32_bytes(&scores))],
+            dst,
+            blocks * ne,
+            1e-5,
+        );
+    }
+}
+
+/// The all-`-inf` window (`0/0`): `Op::CompressPool` defines it as exactly `0.0`, deviating from
+/// ggml's NaN so the backends can be shown to AGREE — `assert_parity` alone could not, since a
+/// NaN compares unequal to itself. Blocks 0 and 2 are fully sentinel, block 1 is not, which also
+/// pins that the zero does not leak into a neighbour's average.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn compress_pool_all_neg_inf_window_is_zero() {
+    let c: CpCase = ("all -inf", 3, 6, 70, 0, false);
+    let (_, blocks, window, ne, _, _) = c;
+    let (values, mut scores) = cp_inputs(c);
+    for b in [0usize, 2] {
+        scores[b * window * ne..][..window * ne].fill(f32::NEG_INFINITY);
+    }
+    let (g, vi, si, dst) = cp_graph(c);
+    let bound = [(vi, f32_bytes(&values)), (si, f32_bytes(&scores))];
+    let mtl = run(
+        &MetalBackend::new().expect("metal backend"),
+        &g,
+        &bound,
+        dst,
+        blocks * ne,
+    );
+    for b in [0usize, 2] {
+        let row = &mtl[b * ne..][..ne];
+        assert!(
+            row.iter().all(|v| *v == 0.0),
+            "metal: an all-(-inf) window must pool to exactly 0.0, got {row:?}"
+        );
+    }
+    assert_parity(&g, &bound, dst, blocks * ne, 1e-5);
+}

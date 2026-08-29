@@ -1327,6 +1327,40 @@ weights, so the shared bias argument is weaker and they may well be fine, but
 they have not been re-examined against a probability cosine and should not be
 assumed sound just because they are high.
 
+### B65 — 29 elementwise dispatchers use the UNSPLIT grid and can exceed `maxComputeWorkGroupCount[0]` (2026-08-13)
+
+**Tag:** vulkan · **Blocked on:** nothing; found in review, scoped out because
+sweeping it needs a shader edit per kernel
+
+`Recorder::dispatch` puts every workgroup in dimension 0.
+`Recorder::dispatch_wide` exists precisely because that overflows
+`VkPhysicalDeviceLimits::maxComputeWorkGroupCount[0]`, whose spec-guaranteed
+minimum is `MAX_GROUP_COUNT_X` — a limit Mesa ANV on an Intel A770 enforces
+exactly, per that constant's own doc. Using it is a PAIR: the host splits the
+grid into `(gx, gy)` and the shader must recover the flat index as
+`gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x`, so a dispatcher
+cannot be switched over without editing its shader too.
+
+`Op::CompressPool` was switched to `dispatch_wide` when it landed — one thread
+per output element makes its grid `ceil(blocks*n_embd / 64)`, and a CSA layer at
+a 128k context is `ceil(n_ctx/4)` blocks, which clears the limit on a real
+model. The sweep is what was NOT done: **29 call sites in
+`crates/infr-vulkan/src/recorder.rs` still call plain `dispatch` with a flat
+`div_ceil` grid**, and the elementwise ones scale with `rows * n_embd`, which is
+the same shape. `Recorder::hyper_post` is the clearest sibling — its grid is
+`ceil(rows*hc*n_embd / 64)`, over the limit at ordinary prefill widths on a
+hyper-connected model.
+
+What is established: the pairing works, and the recovery is load-bearing. Both
+were shown by pinning `MAX_GROUP_COUNT_X` to `2`, re-running
+`compress_pool_parity` (green, so the split path computes the right answer),
+then reverting the shader to bare `gl_GlobalInvocationID.x` under the same pin
+and watching it go RED. What is NOT established: which of the 29 are actually
+reachable past the limit on a real model — that is per-call-site arithmetic
+nobody has done. The failure mode is not a clean error; it is a dispatch the
+driver may reject or silently truncate, which is why this is worth doing before
+someone meets it on an Arc.
+
 ### B61 — the native-block GEMM/MMQ family keeps the unguarded `k/BLK` floor (2026-08-12)
 
 **Tag:** vulkan · **Blocked on:** nothing; a decision about how far the B39
@@ -1351,10 +1385,10 @@ sizes are 32/64/256 and therefore already divide any legal `k` — so unlike the
 GEMV path there is no dtype (BF16/F16/F32) that can even express an off-grid
 row. Reaching it needs a hand-built synthetic tensor, which is precisely the
 hazard B39 was about, so this is a real gap and not a non-issue. The reason to
-stop was scope: each
-`matmul*\*` entry carries its own tiling constraints (`gemm.rs`'s `matmul_f16`already asserts`m,n
-%64 && k %32`) and several take `k` with different meanings, so a uniform guard
-needs its own read of the family rather than a mechanical sweep.
+stop was scope: each `matmul*\*` entry carries its own tiling constraints
+(`gemm.rs`'s `matmul_f16`already asserts`m,n %64 && k %32`) and several take `k`
+with different meanings, so a uniform guard needs its own read of the family
+rather than a mechanical sweep.
 
 **Not the same defect, checked while here:** `native_gemm.comp` (the coopmat
 prefill GEMM, the one path that DOES take BF16) steps
@@ -1379,8 +1413,6 @@ change.
 
 **Slice B — ratios 4 and 128.** Needs new ops, not just wiring:
 
-- A **per-channel softmax pooling** op (softmax over the block axis, then a
-  weighted sum) — no current op does it.
 - Persistent **compressor state** buffers with the ring-update and commit plan
   of `dsv4_build_comp_plan`, including the `[persistent | scratch | sentinel]`
   gather layout and the two-contiguous-halves read order for the overlapping
@@ -1561,6 +1593,58 @@ and parity-tested on CPU + Vulkan (and typechecked on Metal). What is left:
   are pinned in exact arithmetic by `hyper_connect_details_are_load_bearing`. If
   a real V4 GGUF turns out to use a small eps, a backend that dropped the
   over-dst eps would pass every test here.
+
+### B-DSV4-POOL — what `Op::CompressPool` does NOT cover yet (2026-08-13)
+
+**Tag:** deepseek · vulkan · metal · **Blocked on:** nothing; scoped out of the
+op-level slice, which was explicitly "add the primitive, emit nothing"
+
+`Op::CompressPool` is implemented and parity-tested on CPU + Vulkan (and
+typechecked on Metal): the four ggml nodes both V4 compressor variants share,
+fused, with the permutes folded into the indexing. What is left:
+
+- **Nothing emits it.** `crates/infr-llama/src` was deliberately untouched. The
+  op is only half of what slice B needs: the GATHER that produces its
+  `[blocks, window, n_embd]` operands — the `[persistent | scratch | sentinel]`
+  layout and the two-contiguous-halves read order for the overlapping
+  compressors — is the other half and does not exist (see § B-DSV4-WIRING).
+- **An all-`-inf` window returns `0.0`, deviating from ggml's `NaN`.** The
+  reasoning is on `Op::CompressPool`'s doc and in `docs/deepseek.md` § "The
+  compressed-KV state machine"; the ggml behaviour was read off
+  `ggml_vec_soft_max_f32` in `ggml-cpu/vec.cpp`, not assumed. What is NOT
+  established is whether a real V4 forward pass ever PRODUCES such a window —
+  `dsv4_build_comp_plan` should only ever pool blocks with at least one real
+  row, so the case may be unreachable in practice. If it turns out to be
+  reachable, the choice of `0.0` becomes a numerical difference from llama.cpp
+  worth re-arguing rather than a defensive default.
+- **Scores are assumed finite-or-`-inf`.** A `+inf` or `NaN` score is out of
+  contract and unchecked on every backend; it would produce `NaN` silently. The
+  gather that will feed this op is what should make that impossible, and it does
+  not exist yet.
+- **Perf is unmeasured, and the kernel is the obvious shape, not a tuned one.**
+  Vulkan and Metal run one thread per output element, each walking its own
+  window with stride `n_embd`, and read `scores` twice (max pass, then exp
+  pass). At HCA's `window = 128` that is 128 strided loads per lane; a
+  workgroup-cooperative form (one group per block, lanes splitting the window, a
+  subgroup max/sum reduction) is the natural next step but has nothing to
+  justify it until there is a caller to profile. The CPU arm keeps two
+  `n_embd`-wide scratch vectors per block, allocated inside the chunk closure —
+  fine for a test, worth hoisting if it ever runs hot.
+- **Metal has never been executed.** No Apple hardware; `compress_pool_f32`
+  typechecks only in the sense that its Rust caller does
+  (`cargo check -p infr-metal --all-targets --target x86_64-apple-darwin`). MSL
+  is compiled on-device at runtime, so the macOS CI job is its first real
+  compile AND its first execution, and `crates/infr-metal/tests/parity.rs`'s
+  `#[ignore]`d `compress_pool_parity` /
+  `compress_pool_all_neg_inf_window_is_zero` are what will report it.
+- **`maxerr`/`maxerr64` in `seam_op_parity.rs` silently swallow NaN** — they
+  fold with `f32::max`/`f64::max`, which return the non-NaN operand, so an
+  all-NaN output reduces to an error of `0.0` and reads as a perfect match. This
+  was found by injecting a dropped max-subtract into the CPU arm and watching
+  the wide-score case PASS. `compress_pool_parity` now calls its own
+  `cp_assert_finite` first; the other ~40 tests in that file still use the bare
+  helpers and would not notice a NaN-producing kernel. Fixing the helpers
+  themselves is a whole-file change this slice did not own.
 
 ### B-DSV4-HASH — what hash-routed MoE / the SwiGLU clamp do NOT cover yet (2026-08-13)
 

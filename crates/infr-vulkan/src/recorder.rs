@@ -4300,6 +4300,38 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// DeepSeek V4 compressor pooling (`compress_pool.comp`, `Op::CompressPool`): per channel,
+    /// softmax `scores` over the `window` axis and average `values` under it. One thread per
+    /// output element (`blocks * n_embd`), each walking its own window.
+    pub fn compress_pool(
+        &self,
+        values: &dyn Buffer,
+        scores: &dyn Buffer,
+        dst: &dyn Buffer,
+        blocks: u32,
+        window: u32,
+        n_embd: u32,
+    ) {
+        let total = blocks * n_embd;
+        let k = self
+            .be
+            .kernel("compress_pool", crate::gemm::compress_pool_spv(), 3, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&window.to_ne_bytes());
+        push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
+        push[8..12].copy_from_slice(&total.to_ne_bytes());
+        // `dispatch_wide`, not `dispatch`: one thread per output element puts `blocks*n_embd`
+        // over `MAX_GROUP_COUNT_X` on a real V4 context (a CSA layer's block count is
+        // `ceil(n_ctx/4)`), and the shader recovers the flat index across the 2-D split.
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(values), Self::vkb(scores), Self::vkb(dst)],
+            1,
+            &push,
+            total.div_ceil(64),
+        );
+    }
+
     /// DeepSeek V3.2 lightning indexer (`lightning_indexer.comp`, `Op::LightningIndexer`): scores
     /// every cached key against the row's indexer heads and writes the top-`top_k` key indices.
     /// One workgroup per query row — the dispatch below is `rows` groups, and each group's 256

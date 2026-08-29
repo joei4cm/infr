@@ -602,6 +602,58 @@ pub enum Op {
         hc: u32,
         n_embd: u32,
     },
+    /// DeepSeek V4 compressor **pooling** — the shared core of both compressor variants
+    /// (`deepseek4.cpp`'s `build_hca_compressed_kv_from_state` and
+    /// `build_overlap_compressed_kv_from_state`). Each block collapses a `window` of cached KV rows
+    /// into ONE row by a softmax-weighted average, the weights coming from a parallel `window` of
+    /// per-element scores:
+    ///
+    /// ```text
+    /// m        = max_w scores[b, w, c]
+    /// dst[b,c] = (Σ_w values[b, w, c] * exp(scores[b, w, c] − m)) / (Σ_w exp(scores[b, w, c] − m))
+    /// ```
+    ///
+    /// **The softmax runs over the WINDOW axis, per channel** — NOT over `n_embd`. That is what the
+    /// pair of `ggml_permute`s around the `ggml_soft_max` in the reference buys: they make the
+    /// window the fast axis so ggml's row-softmax reduces over it. Reducing over the feature axis
+    /// instead runs, produces finite, plausibly-scaled output, and is wrong; it is the single thing
+    /// this op exists to pin down. Both `values` and `scores` are laid out `[blocks, window,
+    /// n_embd]` here (`n_embd` fastest, as [`Op::HyperConnectPost`]'s `residual` is), so the
+    /// permutes are folded into this op's indexing — nothing is materialised, and the two full
+    /// `ggml_cont`s of the permuted `[n_embd, window, blocks]` tensors the reference pays are
+    /// simply absent.
+    ///
+    /// **`-inf` scores are a normal input, not an edge case.** The overlapping compressor appends a
+    /// sentinel row of `-INFINITY` scores over zero values (`dsv4_append_zero_row(…, true)`) and
+    /// the state gather points every out-of-range window slot at it, so early blocks routinely read
+    /// a window with some `-inf` lanes; those must weigh exactly zero, which the max-subtract above
+    /// gives and a bare `exp(x)/Σexp(x)` does not.
+    ///
+    /// A window that is entirely `-inf` has no defined softmax (`0/0`). **Every backend here writes
+    /// `0.0` for that channel.** This DEVIATES from ggml, which computes `exp(-inf − -inf)` = `NaN`
+    /// and propagates NaN across the row (`ggml_vec_soft_max_f32` in `ggml-cpu/vec.cpp`, called
+    /// from `ggml_compute_forward_soft_max_f32`, which only catches it behind an `assert(sum > 0.0)`
+    /// compiled out of release builds). Zero is chosen because it is the value the sentinel's own
+    /// zero `values` make meaningful, because a NaN cannot be told from a real defect once it has
+    /// poisoned the rest of the graph, and because three backends can be *tested* to agree on `0.0`
+    /// where `NaN != NaN` makes a parity assertion vacuous. Scores are otherwise assumed finite:
+    /// a `+inf` or `NaN` score is out of contract and unchecked.
+    CompressPool {
+        /// The gathered KV window `[blocks, window, n_embd]` f32.
+        values: TensorId,
+        /// The gathered score window `[blocks, window, n_embd]` f32, `-inf` where a slot is a
+        /// sentinel.
+        scores: TensorId,
+        /// The pooled block rows `[blocks, n_embd]` f32.
+        dst: TensorId,
+        /// Compressed block count.
+        blocks: u32,
+        /// Cached rows pooled per block — `DSV4_HCA_RATIO` for the HCA compressor, `2*ratio` for
+        /// the overlapping CSA/LID one (it concatenates a previous and a current half).
+        window: u32,
+        /// Channels per row; the compressor's `n_embd_head`, doubled where the tier doubles it.
+        n_embd: u32,
+    },
     /// DeepSeek V3.2's **lightning indexer** (`deepseek32.cpp`'s `// lightning indexer` block, the
     /// non-fused branch): a cheap per-(query row, key) relevance score whose top-`top_k` keys are
     /// the only ones that layer's real MLA attention may then see. Per query row `t` at absolute
@@ -1096,6 +1148,7 @@ impl Op {
             Op::HyperConnectMix { .. } => "HyperConnectMix",
             Op::HyperConnectPre { .. } => "HyperConnectPre",
             Op::HyperConnectPost { .. } => "HyperConnectPost",
+            Op::CompressPool { .. } => "CompressPool",
             Op::GatedAct { .. } => "GatedAct",
             Op::GatedActFused { .. } => "GatedActFused",
             Op::Add { .. } => "Add",
@@ -1239,6 +1292,12 @@ impl Op {
                 dst,
                 ..
             } => (vec![x, residual, post, comb], vec![dst]),
+            Op::CompressPool {
+                values,
+                scores,
+                dst,
+                ..
+            } => (vec![values, scores], vec![dst]),
             Op::GatedAct { gate, up, dst, .. } => (vec![gate, up], vec![dst]),
             Op::GatedActFused { gu, dst, .. } => (vec![gu], vec![dst]),
             Op::Add { a, b, dst, .. } => (vec![a, b], vec![dst]),

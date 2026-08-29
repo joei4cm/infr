@@ -1405,6 +1405,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::HyperConnectMix { .. } => "HyperConnectMix",
         Op::HyperConnectPre { .. } => "HyperConnectPre",
         Op::HyperConnectPost { .. } => "HyperConnectPost",
+        Op::CompressPool { .. } => "CompressPool",
         Op::GatedAct { .. } => "GatedAct",
         Op::GatedActFused { .. } => "GatedActFused",
         Op::Add { .. } => "Add",
@@ -5784,6 +5785,38 @@ impl MetalBackend {
                         bd.as_ref(),
                     ],
                     1 << 4,
+                    &p,
+                    total,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::CompressPool {
+                values,
+                scores,
+                dst,
+                blocks,
+                window,
+                n_embd,
+            } => {
+                if window < 1 || n_embd < 1 {
+                    return Err(Error::Unsupported(format!(
+                        "metal Op::CompressPool: window {window} / n_embd {n_embd} — a block \
+                         pools at least one row of at least one channel"
+                    )));
+                }
+                let total = (blocks as usize) * (n_embd as usize);
+                let bv = self.ensure_device(r, values);
+                let bs = self.ensure_device(r, scores);
+                let bd = self.dev_dst(r, dst, total);
+                let mut p = window.to_ne_bytes().to_vec();
+                p.extend_from_slice(&n_embd.to_ne_bytes());
+                p.extend_from_slice(&(total as u32).to_ne_bytes());
+                let pso = self.pipelines.get("compress_pool_f32")?;
+                self.encode_w(
+                    r,
+                    &pso,
+                    &[bv.as_ref(), bs.as_ref(), bd.as_ref()],
+                    1 << 2,
                     &p,
                     total,
                 );
