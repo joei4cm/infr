@@ -2698,3 +2698,182 @@ re-derived):
   this was written on". Given that is still true of every Windows path here, a
   note about what is unverified is worth more than the tidier sentence that
   replaced it.
+
+### B67 — `moe_topk.comp` corrupts routing above 256 experts (2026-08-30)
+
+**Tag:** Vulkan MoE · **Blocked on:** nothing; found while planning Qwen3.8, not
+fixed because no currently supported model trips it
+
+`crates/infr-vulkan/shaders/moe_topk.comp` declares `shared float ssel_adj[256]`
+with the comment "256 experts → 1 KB shared — well within limits", while the
+top-k selection scan immediately below it is sized for 1024
+(`#define MAX_CHUNKS 8u`, commented "128 lanes \* 8 chunks = 1024 experts"). The
+two disagree, and the smaller one wins destructively: the no-extension branch —
+the path every `qwen35moe` layer takes — fills the array across the full expert
+count unconditionally
+(`for (uint e = 0u; e < pc.n_expert; e++) ssel_adj[e] = 0.0;`), and the
+selection loop reads `ssel_adj[e]` for every `e < pc.n_expert`.
+
+At `n_expert = 512` that is an out-of-bounds shared-memory write **and** read.
+In GLSL that is undefined behaviour, so the failure is corrupted routing weights
+or a driver-dependent hang — not a clean refusal. There is no Rust-side guard
+either: `recorder.rs`'s `moe_topk` passes `n_expert` into the push constants
+with no bound check, so nothing fails loudly first.
+
+This has never fired because no supported model exceeds 256 experts (DeepSeek's
+largest sits exactly at the boundary, which is presumably where the constant
+came from). Both Qwen3.8 MoE models have **512** experts — `Qwen3.8-2.4T-A95B`
+(`qwen35moe`) and `Qwen3.8-Flash-Next` (`qwen4exp`) — so this blocks the GPU
+path for either. The CPU MoE router is `Vec`-based and unaffected, so CPU-only
+inference would be correct.
+
+**Verified:** the shader source and the absence of a `recorder.rs` guard were
+both read directly. **Not verified:** no 512-expert model has been run, here or
+anywhere in this tree — the OOB is read off the code, not observed.
+
+Fix: size `ssel_adj` to the 1024 the selection scan already assumes (4 KB
+shared, still comfortable) or chunk-index it the way `taken[]` is done, **and**
+add the bound as an explicit `bail!` on the Rust side so a future ceiling is
+refused rather than silently exceeded. See [qwen38.md](qwen38.md) for the models
+that need it.
+
+## Whole-codebase correctness review 2026-08-30
+
+### Medium — constrained fast-forward can exceed `max_tokens`
+
+`crates/infr-llama/src/seam/runner.rs:5901` appends every token returned by
+`constrained_step` before checking the request budget. `constrained_step`
+consumes and returns the complete forced vector at
+`crates/infr-llama/src/grammar.rs:182`, so one decode iteration can exceed
+`max_new`.
+
+**Repro:** `/v1/chat/completions` with `max_tokens: 1`, a forced tool choice,
+and a grammar state whose next forced vector is `[20, 21, 22]`.
+
+**Expect:** at most one completion token is emitted and counted.
+
+**Actual:** all three tokens are emitted and counted before the budget check at
+`crates/infr-llama/src/seam/runner.rs:5922`.
+
+**Action:** limit grammar consumption to the remaining budget and add a
+regression test whose forced vector exceeds that budget.
+
+### Medium — required tool choice falls back to ordinary text
+
+`crates/infr-cli/src/main.rs:1977` converts constrained-generation errors into
+`false`, and invalid or nameless JSON does the same. The path resets the session
+and deliberately retries unconstrained generation at
+`crates/infr-cli/src/main.rs:1989`, despite `tool_constraint_for` classifying
+`"required"` and named choices as forced at
+`crates/infr-llama/src/grammar.rs:223`.
+
+**Repro:** submit a valid forced tool request on a tokenizer/model for which the
+known non-canonical grammar bridge produces an empty or unparseable constrained
+body.
+
+**Expect:** a valid requested tool call, or an error saying the forced contract
+could not be satisfied.
+
+**Actual:** unconstrained assistant text can be returned with no tool call.
+
+**Action:** do not downgrade forced choices; propagate constrained-generation or
+parse failure and test that successful required/named responses always carry the
+requested tool.
+
+### Medium — request deadline does not stop prompt prefill
+
+The server deadline sets its `cancel` atomic at
+`crates/infr-server/src/lib.rs:1493`, but `run_chat` creates a distinct
+`RequestCtx` abort latch at `crates/infr-cli/src/main.rs:1936`. The prefill loop
+polls only `RequestCtx` through `abort_requested` at
+`crates/infr-llama/src/seam/runner.rs:5312`; the external cancellation is copied
+into that context only from the generated-piece callback at
+`crates/infr-cli/src/main.rs:2015`, after prefill.
+
+**Repro:** set `serve.request_timeout_secs` below the runtime of a long,
+multi-chunk prompt prefill.
+
+**Expect:** the in-flight chunk drains, then the next prefill-boundary poll
+stops the request.
+
+**Actual:** every prefill chunk runs; cancellation reaches `RequestCtx` only
+when generation emits its first piece.
+
+**Action:** make `RequestCtx` directly observe the server cancellation source,
+or expose the exact abort handle to the deadline; test cancellation during a
+prefill-only interval.
+
+### Medium — complete stream partial is stuck on HTTP 416
+
+`crates/infr-hub/src/download.rs:286` derives the resume offset from the partial
+file length and requests `bytes={have}-`. A server response of
+`416 Range Not Satisfiable` exits through the generic non-success path at
+`crates/infr-hub/src/download.rs:311`, before the existing partial can reach the
+hash/commit gate.
+
+**Repro:** leave a complete `N`-byte `.dl-*` file by terminating after
+`stream_into` finishes but before `commit`, then retry against a server that
+answers `Range: bytes=N-` with `416` and `Content-Range: bytes */N`.
+
+**Expect:** verify and commit the complete partial, or discard it and restart.
+
+**Actual:** each retry sends the same unsatisfiable range and leaves the partial
+unchanged.
+
+**Action:** handle `416` explicitly; when the advertised total equals `have`,
+run the existing commit gate, otherwise restart safely. Add a crash-recovery
+test.
+
+### Low — stream resume accepts a 206 for the wrong range
+
+`crates/infr-hub/src/download.rs:318` classifies any `206 Partial Content` as a
+valid continuation without checking `Content-Range`, then appends it at
+`crates/infr-hub/src/download.rs:346`. Non-LFS `generation_config.json` has no
+expected digest, so valid but wrong JSON can pass the commit gate and alter
+sampling defaults. The ranged downloader already performs the missing exact
+check at `crates/infr-hub/src/ranged.rs:422`.
+
+**Repro:** keep the nine-byte prefix `{"top_k":`, request `bytes=9-`, and return
+`206`, `Content-Range: bytes 10-11/12`, body `0}`.
+
+**Expect:** reject the mismatched range.
+
+**Actual:** append the body and commit valid but incorrect `{"top_k":0}`.
+
+**Action:** share the ranged path's `Content-Range` validation and test wrong
+start, missing header, inconsistent total, and short body.
+
+### Cleared
+
+- Empty-logit sampling does not expose a reachable empty-vocabulary generation
+  path; its public helper's token-zero result remains internal behavior.
+- DSV4 compressor zero-dimension arithmetic is currently unreachable bring-up
+  code, not a production defect.
+- Ordinary-attention `key_bias` is retained because incompatible flash/dynamic
+  paths are rejected and biased attention is routed through consuming kernels.
+- Sampled GGUF shard and tensor offsets use checked arithmetic and validate
+  alignment and mapped ranges before slicing.
+- Examined stop matching, SSE terminal framing, and completion accounting retain
+  their stated token-boundary invariants.
+- Unknown model IDs intentionally route to the documented default hosted model.
+
+### Hardening
+
+- `download_to_blob` trusts an existing expected-hash blob because its
+  content-addressed filename exists; rehashing would detect external cache
+  corruption, but no repository-controlled invariant break was found.
+- DSV4 compressor-plan constructors should reject zero ratio/state dimensions if
+  that bring-up path becomes reachable.
+- Keep the non-empty distribution contract explicit in sampling internals rather
+  than relying on current callers.
+
+### Coverage
+
+Reviewed the clean working tree across workspace entry points, public APIs,
+unchecked arithmetic/indexing, panic and error paths, cancellation, HTTP range
+handling, unsafe/FFI boundaries, and sampled CPU, Vulkan, Metal, GGUF, server,
+CLI, hub, chat, profiling, and llama paths.
+
+**Gaps:** most numerical kernels and shader math were not reviewed line by line;
+platform-only Metal and Windows behavior was not executed. No formatter, linter,
+build, or test command was run for this report.

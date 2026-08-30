@@ -44,6 +44,10 @@ at that index. It holds:
 
 - [qwen35.md](qwen35.md) — Qwen3.5 / Qwen3.6 (`qwen35`): the gated-DeltaNet
   linear-attention + full-attention hybrid, and the interleaved q+gate trap.
+- [qwen38.md](qwen38.md) — Qwen3.8 support plan. One release name, three archs:
+  the dense 27B is `qwen35` and may already run, the 2.4T is `qwen35moe`, and
+  Flash-Next is a net-new `qwen4exp` (hyper-connections, n-gram PLE,
+  block-sparse QSA) that reuses DeepSeek V4's compressed-KV machinery.
 - [diffusion-gemma.md](diffusion-gemma.md) — DiffusionGemma design for the
   unified seam: block text-diffusion, the canvas denoise graph, and
   self-conditioning.
