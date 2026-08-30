@@ -95,10 +95,36 @@ the table above:
   (`Cargo.toml:99`).
 
 So a third capability belongs in the crate — **config/cache/data directory
-resolution** — and the fix is to use `dirs` uniformly rather than to write more
-`cfg` arms. Note this item is **new API closing a bug, not a relocation**: it is
-the one part of this work that changes behaviour on Windows, from "silently
+resolution**. Note this item is **new API closing a bug, not a relocation**: it
+is the one part of this work that changes behaviour on Windows, from "silently
 cannot find config" to "works".
+
+**The fix is `dirs::home_dir()`, not `dirs::config_dir()`.** The distinction
+matters: `config_dir()` returns `~/Library/Application Support` on macOS and
+`%APPDATA%` on Windows, so adopting it would silently **relocate** the config
+file for existing macOS users. Resolving `$XDG_CONFIG_HOME`, else
+`dirs::home_dir()?.join(".config")`, keeps today's layout everywhere it already
+works and only adds the platform that is broken — Windows, where
+`dirs::home_dir()` goes through the `FOLDERID_Profile` Known Folder
+(`dirs-sys-0.4.1`'s `known_folder_profile`) instead of the `$HOME` that Windows
+never sets. The whole defect is that one substitution: `env::var_os("HOME")`
+versus `dirs::home_dir()`.
+
+That is also the house policy elsewhere in this org. `hjkl-xdg` implements
+exactly this — `resolve()` takes `std::env::var_os(var)` and `dirs::home_dir()`
+— and `hjkl-config`/`hjkl-fs` delegate to it rather than re-deriving it, with
+the stated rationale that "macOS users get `~/.config/<app>` instead of
+`~/Library/Application Support/<app>` because we ship CLI tools, not signed
+`.app` bundles. Windows users get `~/.config/<app>` instead of `%APPDATA%\<app>`
+for the same reason." So the choice is:
+
+- **Fix it locally** — three lines in `infr-plat`, no new dependency.
+- **Depend on `hjkl-xdg`** — the policy implemented once instead of a fifth
+  time, which is the argument its own source makes: "two copies of a path
+  resolver is how a fix lands in one of them and silently misses the other."
+  infr currently has four copies (three hand-rolled, plus `store.rs` using
+  `dirs::cache_dir()` — a fifth convention). Taking on a new dependency is a
+  call for the maintainer, so this document does not make it.
 
 ### Problem C is a stub, not a second platform
 
