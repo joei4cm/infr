@@ -1,0 +1,42 @@
+# Compose helper for the Vulkan / Mesa image (Intel Arc ANV + AMD RADV).
+#
+# Host prerequisites:
+#   - /dev/dri render nodes (e.g. renderD128)
+#   - Your user in the `render` (and often `video`) group, OR pass the render
+#     GID explicitly via group_add below.
+#
+# Discover the render GID on the host:
+#   stat -c '%g' /dev/dri/renderD128
+# Then either uncomment group_add with that numeric GID, or rely on the
+# container user already matching (root in this image can often open DRI, but
+# group_add is the reliable path for non-root later).
+#
+# Usage:
+#   docker compose -f docker/compose.vulkan.yml run --rm infr devices
+#   docker compose -f docker/compose.vulkan.yml run --rm infr run MODEL -p "hi"
+#
+# Override the device index if `infr devices` shows more than one GPU:
+#   INFR_DEV=Vulkan1 docker compose -f docker/compose.vulkan.yml run --rm infr devices
+
+services:
+  infr:
+    image: infr:vulkan
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.vulkan
+    devices:
+      - /dev/dri
+    # Uncomment and set to the host render node GID (see header comment):
+    # group_add:
+    #   - "992"
+    environment:
+      INFR_DEV: ${INFR_DEV:-Vulkan0}
+      HF_HOME: /data/huggingface
+      # HF_TOKEN: ${HF_TOKEN:-}   # gated repos
+    volumes:
+      # Shared HuggingFace hub cache (same layout as host `~/.cache/huggingface`)
+      - ${HOME}/.cache/huggingface:/data/huggingface
+      - ${INFR_DATA:-.}:/data/work
+    working_dir: /data/work
+    # Default command lists Vulkan devices; override on the compose CLI.
+    command: ["devices"]

@@ -1,0 +1,41 @@
+# Build artifacts
+target/
+target-prof/
+**/*.rs.bk
+Cargo.lock.bak
+*.spv
+
+# VCS / CI
+.git/
+.github/
+.gitattributes
+
+# Docs & local notes (not needed to compile the binary)
+docs/
+CHANGELOG.md
+LICENSE
+
+# Models / weights / caches
+*.gguf
+*.safetensors
+**/.cache/
+**/huggingface/
+.cache/
+ref/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+*.iml
+
+# Host-side helpers (Dockerfiles are read from the host; only the SYCL
+# entrypoint stub needs to be in the build context)
+scripts/
+docker/compose*.yml
+docker/README.md
+docker/Dockerfile.*
+
+# Perf archives and local dumps
+**/perf/

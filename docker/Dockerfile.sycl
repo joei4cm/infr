@@ -1,0 +1,45 @@
+# infr SYCL / oneAPI — Phase-2 SCAFFOLD only.
+#
+# This image does NOT run inference. There is no Rust SYCL Backend yet; the
+# entrypoint is a stub that points at docs/intel-gpu.md. When a Backend lands,
+# replace the stub with a real multi-stage build that copies `infr` and wires
+# Level Zero the same way ash wires Vulkan today.
+#
+# Base: Intel deep-learning-essentials (Ubuntu 24.04) — oneAPI / SYCL toolchain
+# plus GPU runtime. Pin can be bumped when the Backend is implemented.
+#
+#   docker build -f docker/Dockerfile.sycl -t infr:sycl-intel .
+#
+# Typical host run flags (same DRM node pattern as the Vulkan image):
+#   --device /dev/dri --group-add $(stat -c '%g' /dev/dri/renderD128)
+
+FROM intel/deep-learning-essentials:2025.3.3-0-devel-ubuntu24.04
+
+LABEL org.opencontainers.image.title="infr (SYCL / Intel — scaffold)" \
+      org.opencontainers.image.description="Phase-2 scaffold for a future infr Intel SYCL/oneAPI Backend — does not run inference" \
+      org.opencontainers.image.source="https://github.com/kryptic-sh/infr" \
+      org.opencontainers.image.url="https://github.com/kryptic-sh/infr" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="0.0.0"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    HF_HOME=/data/huggingface
+
+# Level Zero / compute-runtime as available from apt on this base. The Intel
+# image already ships much of this; install whatever the archive provides so a
+# future Backend can link against Level Zero without rewriting the Dockerfile.
+RUN apt-get update \
+ && (apt-get install -y --no-install-recommends \
+        ca-certificates \
+        level-zero \
+        level-zero-dev \
+     || apt-get install -y --no-install-recommends ca-certificates) \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /data
+
+COPY docker/sycl-entrypoint.sh /usr/local/bin/infr-sycl-stub
+RUN chmod +x /usr/local/bin/infr-sycl-stub
+
+# Stub only — do not claim this runs infr inference.
+ENTRYPOINT ["/usr/local/bin/infr-sycl-stub"]

@@ -1,0 +1,52 @@
+# Build Docker images (no GPU required on the runner).
+# Full Rust compile inside Ubuntu 26.04 — path-filtered + manual dispatch.
+
+name: Docker
+
+on:
+  workflow_dispatch: {}
+  push:
+    paths:
+      - "docker/**"
+      - "scripts/docker-build.sh"
+      - ".dockerignore"
+      - ".github/workflows/docker.yml"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "docker/**"
+      - "scripts/docker-build.sh"
+      - ".dockerignore"
+      - ".github/workflows/docker.yml"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    name: docker build (${{ matrix.target }})
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # SYCL scaffold pulls a large Intel base image and does not run
+        # inference — keep it out of PR CI; build with:
+        #   ./scripts/docker-build.sh sycl
+        target: [cpu, vulkan]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build ${{ matrix.target }}
+        run: |
+          chmod +x scripts/docker-build.sh
+          ./scripts/docker-build.sh "${{ matrix.target }}"

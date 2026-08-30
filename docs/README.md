@@ -39,6 +39,11 @@ at that index. It holds:
 - [igpu.md](igpu.md) — integrated-GPU correctness campaign (AMD APU / Intel iGPU
   / Strix Halo class): the UMA heap-table insight, the per-submit watchdog
   root-cause + submit-splitter fix, and the model survey. Phase 1 complete.
+- [intel-gpu.md](intel-gpu.md) — Intel Arc iGPU/dGPU: Vulkan/Mesa (ANV) as the
+  shipping path, SYCL/oneAPI as Phase 2, why TileLang is not a runtime backend,
+  Docker image matrix (`infr:cpu` / `infr:vulkan` / `infr:sycl-intel` scaffold),
+  and the hardware validation ask. Operator how-to:
+  [`docker/README.md`](../docker/README.md).
 
 ## Models & architectures
 

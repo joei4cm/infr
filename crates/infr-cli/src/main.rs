@@ -883,7 +883,19 @@ fn resolve(model: &str, cfg: &Config) -> anyhow::Result<(PathBuf, Option<PathBuf
 /// `infr devices` — enumerate the Vulkan physical devices (index/name/type/VRAM), mark the default
 /// pick, and report external-memory extensions so the multi-GPU campaign can see the P2P surface.
 fn cmd_devices(cfg: &Config) -> anyhow::Result<()> {
-    let devs = infr_vulkan::VulkanBackend::enumerate_devices(cfg).map_err(|e| anyhow!("{e}"))?;
+    let devs = match infr_vulkan::VulkanBackend::enumerate_devices(cfg) {
+        Ok(d) => d,
+        // Soft-fail: CPU-only hosts / CPU Docker images often lack an ICD (or even
+        // libvulkan). `devices` is a listing command — exit 0 with a hint instead of
+        // treating a missing Vulkan stack as a hard failure.
+        Err(e) => {
+            // print-ok: program OUTPUT — the `infr devices` listing users pipe.
+            println!("no Vulkan physical devices found ({e})");
+            println!("hint: install a Vulkan ICD (e.g. mesa-vulkan-drivers), or use the");
+            println!("      `infr:vulkan` image with `--device /dev/dri` — see docker/README.md");
+            return Ok(());
+        }
+    };
     if devs.is_empty() {
         // print-ok: program OUTPUT — the `infr devices` / `infr resolve` listing users pipe.
         println!("no Vulkan physical devices found");
