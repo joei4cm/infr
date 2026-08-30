@@ -73,6 +73,12 @@ The macOS four are particularly worth noting: `metal-check` already
 cross-compiles this exact crate on every commit, but it runs `cargo check`, not
 `cargo clippy`. Changing one word in that job catches all four.
 
+These paths are a snapshot. [`infr-plat.md`](infr-plat.md) proposes moving
+`hostmem.rs` into a new crate, and lists fixing this exact lint as a
+prerequisite that must land **before** the file moves. If that migration has
+already run, the Windows failure above is fixed and lives at
+`crates/infr-plat/`; verify before re-fixing it.
+
 ## What can cross-compile and what needs a real runner
 
 This is the part that decides the cost, and it is asymmetric. Measured locally:
