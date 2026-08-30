@@ -2626,54 +2626,19 @@ the other two were not chosen.
 **Tag:** PR#91 residual · **Blocked on:** nothing; runner minutes and a decision
 about which jobs are worth fanning out
 
-PR #91 (merged `c59f692`) added native Windows support: `cfg(windows)` arms for
-the `infr-hub` file lock (`LockFileEx`/`UnlockFileEx` against the existing
-`flock`), `ranged::fetch_chunk`'s positional write (`seek_write` retry loop
-against `write_all_at`), `link_blob`'s hard-link fallback, and
-`GlobalMemoryStatusEx` for `available_bytes`. **None of it is built or run by
-CI.** Every job in `.github/workflows/ci.yml` is `ubuntu-26.04` except
-`test-macos`, and that one is narrower than it looks.
+PR #91 (merged `c59f692`) added native Windows support, and no CI job builds,
+lints or runs any of it. **The full analysis and the staged plan now live in
+[ci-matrix.md](ci-matrix.md)** — current job table with measured durations, what
+cross-compiles from a Linux runner versus what needs a real one, and the five
+platform-gated clippy failures that exist in the tree right now
+(`infr-core/src/hostmem.rs` for Windows; four in `infr-metal/src/exec.rs` for
+Apple). This entry keeps only the PR-review residuals below, which are not about
+CI topology and would otherwise be lost when that plan ships.
 
-What is actually covered today, read off the workflow:
-
-| job           | runner       | what it runs                                               |
-| ------------- | ------------ | ---------------------------------------------------------- |
-| `fmt`         | ubuntu-26.04 | `cargo fmt --check`                                        |
-| `clippy`      | ubuntu-26.04 | `--workspace --all-targets --locked -D warnings`           |
-| `test`        | ubuntu-26.04 | `nextest run --workspace` + `cargo test --doc`             |
-| `cpu-goldens` | ubuntu-26.04 | `infr-llama` CPU goldens, real models                      |
-| `build`       | ubuntu-26.04 | `cargo build --release`                                    |
-| `metal-check` | ubuntu-26.04 | `cargo check -p infr-metal --target aarch64-apple-darwin`  |
-| `test-macos`  | macos-15     | `cargo build --workspace`, then `cargo test -p infr-metal` |
-
-Three distinct gaps fall out of that table, and they are worth separating
-because they cost different amounts to close:
-
-1. **No Windows runner at all.** Nothing compiles the `cfg(windows)` arms, so
-   the next edit to `store.rs`, `ranged.rs` or `mem.rs` breaks them silently —
-   the exact failure mode CLAUDE.md calls out, where "not supported here"
-   arrives as "passed". The cheapest fix is a cross-`cargo check` from the
-   existing Ubuntu runner, mirroring what `metal-check` already does for Apple:
-   `--target x86_64-pc-windows-msvc`, no Windows runner needed. Verified locally
-   during the PR review that this catches real drift — `main` before the PR had
-   11 compile errors for `x86_64-pc-windows-gnu`, the PR branch zero. Note
-   `msvc` needs `lib.exe` and so may need the `gnu` target instead on a Linux
-   host; `gnu` is what was actually exercised.
-2. **`clippy` and the test suite are Linux-only, so platform-gated code is
-   unlinted and untested on two of three platforms.** `clippy` never sees a
-   `cfg(windows)` or `cfg(target_os = "macos")` body. `test-macos` BUILDS the
-   workspace but only TESTS `-p infr-metal`, so `infr-hub`'s and `infr-core`'s
-   suites — the crates PR #91 changed — have never run on macOS either. A
-   `runs-on: ${{ matrix.os }}` fan-out over
-   `[ubuntu-26.04, macos-15, windows-2025]` for `clippy` and `test` is the real
-   fix; the open question is cost, since `test` is ~4 minutes on Linux and the
-   goldens job is ~37.
-3. **The one test covering the lock is excluded on the platform the new code was
-   written for.** `file_lock_is_exclusive` is now
-   `#[cfg(not(target_os = "windows"))]`, so the `LockFileEx` path has no test
-   anywhere. Whatever is done about the matrix, that test needs a Windows-shaped
-   equivalent — it is a two-process exclusion check, so it needs a real runner,
-   not a cross-check.
+Two corrections to what this entry originally recorded, both verified since:
+Windows-gated code also lives in `infr-vulkan` (`p2p.rs`, `tp_sem.rs`), not just
+`infr-hub`/`infr-core`; and `infr-core/src/mem.rs` does not exist — the host
+memory arm is `infr-core/src/hostmem.rs`.
 
 **Also raised in the PR review and not addressed** (recorded so they are not
 re-derived):

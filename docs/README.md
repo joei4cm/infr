@@ -65,6 +65,16 @@ at that index. It holds:
   original milestones as history.
 - [train.md](train.md) — LLM training support plan (not yet built).
 
+## Testing & CI
+
+- [synthetic-models.md](synthetic-models.md) — plan to give every architecture a
+  fake in-repo GGUF fixture, so real multi-GB models can be deleted without
+  losing coverage. Why token-hash goldens are not portable, why a golden must be
+  blessed against an external oracle, and which archs are dark today.
+- [ci-matrix.md](ci-matrix.md) — plan to lint and test on Linux, macOS and
+  Windows. What cross-compiles from a Linux runner and what needs a real one,
+  plus the five platform-gated clippy failures CI does not currently see.
+
 ## Audit
 
 - [audit.md](audit.md) — module-by-module codebase audit for bugs, correctness,
