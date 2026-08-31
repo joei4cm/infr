@@ -1,0 +1,83 @@
+# infr Vulkan/Mesa image — Intel Arc (ANV) + AMD (RADV) via mesa-vulkan-drivers.
+#
+# Same build stage as Dockerfile.cpu (Ubuntu 26.04 + recent glslc). Runtime adds
+# Mesa Vulkan ICDs and the GLVND/EGL bits Mesa needs to find DRI devices.
+# vulkan-tools is included for debugging (`vulkaninfo`, `vkcube`).
+#
+# Run (host must expose a DRM render node):
+#
+#   docker run --rm -it \
+#     --device /dev/dri \
+#     --group-add $(stat -c '%g' /dev/dri/renderD128) \
+#     -e INFR_DEV=Vulkan0 \
+#     -v "$HOME/.cache/huggingface:/data/huggingface" \
+#     infr:vulkan devices
+#
+# Pick the right VulkanN with `infr devices` if the host has multiple GPUs.
+#
+#   docker build -f docker/Dockerfile.vulkan -t infr:vulkan .
+
+# ── build ────────────────────────────────────────────────────────────────────
+FROM ubuntu:26.04 AS build
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CARGO_TERM_COLOR=always \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        build-essential \
+        pkg-config \
+        glslc \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal \
+ && rustc --version && cargo --version && glslc --version
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo .cargo
+COPY crates crates
+
+RUN cargo build --release -p infr-cli --locked \
+ && strip target/release/infr \
+ && test -x target/release/infr
+
+# ── runtime ──────────────────────────────────────────────────────────────────
+FROM ubuntu:26.04 AS runtime
+
+LABEL org.opencontainers.image.title="infr (Vulkan / Mesa)" \
+      org.opencontainers.image.description="Pure-Rust LLM inference engine — Vulkan backend (Intel ANV + AMD RADV via Mesa)" \
+      org.opencontainers.image.source="https://github.com/kryptic-sh/infr" \
+      org.opencontainers.image.url="https://github.com/kryptic-sh/infr" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="0.0.0"
+
+# Prefer device 0 inside the container; override with INFR_DEV=VulkanN / --dev.
+ENV DEBIAN_FRONTEND=noninteractive \
+    HF_HOME=/data/huggingface \
+    PATH=/usr/local/bin:$PATH \
+    INFR_DEV=Vulkan0
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        mesa-vulkan-drivers \
+        libvulkan1 \
+        vulkan-tools \
+        libglvnd0 \
+        libegl1 \
+        libgl1 \
+        libglx0 \
+        libgles2 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /src/target/release/infr /usr/local/bin/infr
+
+WORKDIR /data
+ENTRYPOINT ["infr"]

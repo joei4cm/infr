@@ -1254,6 +1254,7 @@ dependencies = [
  "infr-metal",
  "infr-prof",
  "infr-prof-rt",
+ "infr-sycl",
  "infr-vulkan",
  "llguidance",
  "rayon",
@@ -1308,6 +1309,16 @@ dependencies = [
  "tokio",
  "tower",
  "tower-http",
+ "tracing",
+]
+
+[[package]]
+name = "infr-sycl"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "infr-core",
+ "infr-cpu",
  "tracing",
 ]
 

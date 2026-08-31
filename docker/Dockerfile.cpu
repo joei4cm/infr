@@ -1,0 +1,67 @@
+# infr CPU image — multi-stage build matching CI (.github/workflows/ci.yml).
+#
+# Build needs a recent glslc (shaderc): Ubuntu 24.04's package is too old for
+# GL_EXT_integer_dot_product; Ubuntu 26.04 ships shaderc 2025+. ash loads
+# Vulkan via dlopen at runtime, so the CPU image does not need libvulkan.
+#
+#   docker build -f docker/Dockerfile.cpu -t infr:cpu .
+
+# ── build ────────────────────────────────────────────────────────────────────
+FROM ubuntu:26.04 AS build
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CARGO_TERM_COLOR=always \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        build-essential \
+        pkg-config \
+        glslc \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal \
+ && rustc --version && cargo --version && glslc --version
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo .cargo
+COPY crates crates
+
+RUN cargo build --release -p infr-cli --locked \
+ && strip target/release/infr \
+ && test -x target/release/infr
+
+# ── runtime ──────────────────────────────────────────────────────────────────
+FROM ubuntu:26.04 AS runtime
+
+LABEL org.opencontainers.image.title="infr (CPU)" \
+      org.opencontainers.image.description="Pure-Rust LLM inference engine — CPU reference backend" \
+      org.opencontainers.image.source="https://github.com/kryptic-sh/infr" \
+      org.opencontainers.image.url="https://github.com/kryptic-sh/infr" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="0.0.0"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    HF_HOME=/data/huggingface \
+    INFR_DEV=cpu \
+    PATH=/usr/local/bin:$PATH
+
+# libvulkan1 only (no ICD): `infr devices` dlopens ash's loader and should
+# report "no Vulkan physical devices" instead of failing on a missing .so.
+# Actual GPU work belongs in Dockerfile.vulkan.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libvulkan1 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /src/target/release/infr /usr/local/bin/infr
+
+WORKDIR /data
+ENTRYPOINT ["infr"]

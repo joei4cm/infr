@@ -475,6 +475,59 @@ pub(crate) fn generate_dense_cpu_mode(
     out
 }
 
+/// Intel SYCL/oneAPI seam runner (`--dev sycl` / `INFR_DEV=sycl`): the SAME dense forward as
+/// [`generate_dense_cpu`], but through [`infr_sycl::SyclBackend`] instead of a bare `CpuBackend`.
+/// Correctness-first MVP (`infr-sycl`'s doc): `SyclBackend` forwards every `Backend` method to an
+/// OWNED `CpuBackend`, so the graph this drives runs the identical kernels as `--dev cpu` — the
+/// win today is that a real SYCL device gets initialized and logged alongside it (see
+/// `SyclBackend::new_with`), not a faster forward. The weight binder still needs the CONCRETE
+/// `CpuBackend` (`cpu_bind_with` calls `map_weight`/`paged_weight`, which aren't on the `Backend`
+/// trait) — [`infr_sycl::SyclBackend::inner`] hands that back, and it is the SAME instance
+/// `SyclBackend::alloc`/`execute` forward to, so buffers bound here are buffers `generate_dense_backend`
+/// can read through the `&dyn Backend` it was given.
+#[cfg(feature = "sycl")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn generate_dense_sycl(
+    g: &Gguf,
+    cfg: &Config,
+    ec: &std::sync::Arc<EngineConfig>,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    req: Option<&crate::sampling::RequestCtx>,
+    on_token: impl FnMut(u32),
+) -> AResult<(Vec<u32>, GenStats)> {
+    let sycl_be = infr_sycl::SyclBackend::new_with(ec.clone()).map_err(|e| anyhow!("sycl init: {e}"))?;
+    let store = cpu_paged_store(ec, g)?;
+    let bind = cpu_bind_with(sycl_be.inner(), store.clone());
+    let out = generate_dense_backend(
+        &sycl_be,
+        &bind,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+        &mut None,
+        prompt.len() + max_new + 1,
+        None, // constraint
+        None, // verify
+        None, // verify_ids
+        None, // logits_out
+        None, // h_out
+        None, // denoise_req
+        req,
+    );
+    if let Some(store) = store.filter(|_| ec.paging.stats) {
+        report_host_paging(&store);
+    }
+    out
+}
+
 /// `paging.stats` (`INFR_PAGER_STATS=1`): what the host tier actually did, per size class.
 ///
 /// The hit rate alone cannot distinguish a tier that is working from one that was never asked, so

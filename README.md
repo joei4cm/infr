@@ -243,7 +243,17 @@ Deeper design docs, backend architecture, and performance material live in
 [`docs/perf/`](docs/perf/README.md) (all performance: results, benchmarking,
 optimization playbook, kernel coverage), [`docs/config.md`](docs/config.md) (the
 configuration reference), [`docs/metal.md`](docs/metal.md) and
-[`docs/igpu.md`](docs/igpu.md) (backends).
+[`docs/igpu.md`](docs/igpu.md) (backends), [`docs/intel-gpu.md`](docs/intel-gpu.md)
+(Intel Arc + Docker images). Operator guide for container images:
+[`docker/README.md`](docker/README.md). **Trying a release on Intel Arc?
+Start at [`RELEASE.md`](RELEASE.md)** — copy-paste commands for the CPU,
+Vulkan, and SYCL/oneAPI Docker images.
+
+```bash
+./scripts/docker-build.sh cpu      # infr:cpu
+./scripts/docker-build.sh vulkan   # infr:vulkan (Mesa ANV + RADV)
+./scripts/docker-build.sh sycl     # infr:sycl-intel (Intel oneAPI/Level Zero, MVP)
+```
 
 ## License
 

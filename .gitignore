@@ -15,3 +15,7 @@ Cargo.lock.bak
 *.swp
 /ref/
 target-prof/
+
+# Release artifacts (scripts/docker-release.sh output — `docker save` tarballs
+# + SHA256SUMS, never committed)
+/dist/

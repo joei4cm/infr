@@ -1,0 +1,40 @@
+# Build artifacts
+target/
+target-prof/
+**/*.rs.bk
+Cargo.lock.bak
+*.spv
+
+# VCS / CI
+.git/
+.github/
+.gitattributes
+
+# Docs & local notes (not needed to compile the binary)
+docs/
+CHANGELOG.md
+LICENSE
+
+# Models / weights / caches
+*.gguf
+*.safetensors
+**/.cache/
+**/huggingface/
+.cache/
+ref/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+*.iml
+
+# Host-side helpers (Dockerfiles are read from the host via `docker build -f`;
+# none of docker/ needs to be inside the build context — every image COPYs
+# only Cargo.toml/Cargo.lock, .cargo, and crates/ from the repo root)
+scripts/
+docker/
+
+# Perf archives and local dumps
+**/perf/
