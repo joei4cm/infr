@@ -9,6 +9,12 @@ repository.workspace = true
 name = "infr"
 path = "src/main.rs"
 
+[features]
+# Off by default — see `crates/infr-sycl`'s doc. `--dev sycl` / `INFR_DEV=sycl` parses either
+# way (see `parse_dev_spec`); without this feature it fails clearly at RUNTIME asking for a
+# rebuild with `--features sycl`, rather than silently falling back to another device.
+sycl = ["infr-llama/sycl"]
+
 [dependencies]
 infr-core.workspace = true
 infr-prof-rt.workspace = true

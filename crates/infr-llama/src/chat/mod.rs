@@ -24,12 +24,16 @@ use anyhow::Result;
 mod cpu;
 mod diffusion;
 mod metal;
+#[cfg(feature = "sycl")]
+mod sycl;
 mod vulkan;
 
 pub use cpu::CpuDenseChat;
 pub use diffusion::DiffusionGemmaChat;
 #[cfg(target_os = "macos")]
 pub use metal::{MetalSeamChat, SpecMetalChat};
+#[cfg(feature = "sycl")]
+pub use sycl::SyclDenseChat;
 pub use vulkan::DenseSeamChat;
 
 /// The two arch-specific primitives the shared [`Chat`] drives. Object-safe: no generics, callbacks

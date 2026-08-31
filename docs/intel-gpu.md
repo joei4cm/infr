@@ -3,12 +3,24 @@
 Design note for running **infr** on Intel Arc **iGPU** and **dGPU**, and for
 shipping Docker images that make that path reproducible. Companion operational
 docs: [`docker/README.md`](../docker/README.md), [`igpu.md`](igpu.md),
-[`perf/vulkan-review.md`](perf/vulkan-review.md).
+[`perf/vulkan-review.md`](perf/vulkan-review.md). **End-to-end try guide (all
+three images, copy-paste commands): [`../RELEASE.md`](../RELEASE.md).**
 
-> **Status (2026-08-30).** Phase 0/1 Docker images land in-tree (`infr:cpu`,
-> `infr:vulkan`). The engine already has Intel-oriented Vulkan paths (ANV,
-> UMA/iGPU submit splitting, non-coopmat prefill tiers, opt-in 8×8×16 XMX).
-> There is **no** SYCL/Level Zero Backend yet. **TileLang is not an Intel
+> **Status (2026-08-31).** Phase 0/1 Docker images (`infr:cpu`, `infr:vulkan`)
+> are stable. **Phase 2 SYCL Backend is now implemented as an MVP**:
+> `crates/infr-sycl` initializes a real SYCL/Level Zero device through a thin
+> C++ shim (`icpx` when available, degrading gracefully to `clang++`/`c++` or
+> a pure host build when it isn't — see that crate's `build.rs`), and
+> `--dev sycl` / `INFR_DEV=sycl` runs the full compute graph — correctness
+> rides the CPU-reference interpreter end-to-end (`SyclBackend` forwards every
+> `Backend` method except identity to a wrapped `CpuBackend`), with an
+> oneDNN-backed `gemm_f32` primitive exposed for wiring into `Op::Linear` as
+> the accelerated fast path (three-tier fallback in the shim: oneDNN → SYCL
+> `parallel_for` → host loop, so results are correct at every tier).
+> `docker/Dockerfile.sycl` is a real multi-stage build (not a scaffold) —
+> see [`../RELEASE.md`](../RELEASE.md) for the user-facing guide. The engine
+> also has Intel-oriented Vulkan paths (ANV, UMA/iGPU submit splitting,
+> non-coopmat prefill tiers, opt-in 8×8×16 XMX). **TileLang is not an Intel
 > runtime path** for infr today.
 
 ---
@@ -80,11 +92,21 @@ paths**, especially prompt processing. Why it is not automatic for infr:
 | Dual stack | Vulkan↔L0 DMA-BUF hybrid is *possible* but not “thin” |
 | Moving target | Community SYCL vs Vulkan wins flip with Mesa / IGC / concurrency |
 
-**Decision:** ship Docker scaffold (`infr:sycl-intel`) for the *runtime*
-environment; implement a Backend only after Phase 1 numbers on real Arc show
-a gap worth the cost. Prefer **library-first** (oneDNN GEMM + FA) over a full
-kernel rewrite if/when Phase 2 starts. Do **not** build a Vulkan↔oneDNN hybrid
-as the first native attempt.
+**Status: implemented as an MVP** (`crates/infr-sycl`, `--dev sycl` /
+`INFR_DEV=sycl`, real `infr:sycl-intel` image — see
+[`../RELEASE.md`](../RELEASE.md)). As planned, it is **library-first**: a thin
+C++ shim picks `icpx` when available (falling back to `clang++`/`c++`, or a
+pure host build with neither SYCL nor a C++ toolchain that supports it),
+initializes a real SYCL/Level Zero queue, and exposes an oneDNN-backed GEMM
+primitive (`SyclBackend::gemm_f32`) with a SYCL `parallel_for` and a plain host
+loop as further fallback tiers — never a hand-written kernel rewrite. Today
+`SyclBackend` forwards every op except device identity to the CPU-reference
+interpreter (`infr_cpu::CpuBackend`), so a `--dev sycl` run is byte-identical
+to `--dev cpu` while still exercising the real device init/GEMM path; wiring
+`gemm_f32` into `Op::Linear` itself is the natural next step (needs a seam in
+the CPU interpreter to intercept just that op, or a thin `infr-sycl`-side
+interpreter layered in front of it). No Vulkan↔oneDNN hybrid was built, per
+the original decision.
 
 ### 2.4 TileLang — not a substitute
 
@@ -107,7 +129,7 @@ Realistic role for infr:
 | **0** | `infr:cpu` image | Yes (CPU) |
 | **1** | `infr:vulkan` image (Mesa ANV + RADV) + docs + compose | Yes (Intel/AMD Vulkan) |
 | **1b** | Hardware validation matrix (below); optional `INFR_CM_8X8` default flip | Yes |
-| **2** | SYCL/L0 Backend + replace `Dockerfile.sycl` stub | Yes (Intel native) |
+| **2** | SYCL/L0 Backend (`crates/infr-sycl`, MVP) + real `Dockerfile.sycl` | **Yes (MVP)** — device init + correctness-first execute; oneDNN `Op::Linear` wiring is the next step |
 | **—** | TileLang | Out of scope until SPIR-V/Intel codegen exists |
 
 Build helper: [`scripts/docker-build.sh`](../scripts/docker-build.sh).
@@ -183,14 +205,24 @@ CPU-tested; GPU claims stay provisional.
 | --- | ---------- | ------- |
 | `infr:cpu` | `docker/Dockerfile.cpu` | CPU reference; CI-friendly |
 | `infr:vulkan` | `docker/Dockerfile.vulkan` | Mesa Vulkan — Intel ANV + AMD RADV |
-| `infr:sycl-intel` | `docker/Dockerfile.sycl` | Phase-2 **scaffold only** (exits 1) |
+| `infr:sycl-intel` | `docker/Dockerfile.sycl` | SYCL/oneAPI/Level Zero — **real MVP inference image** |
 
-Build stage pins **Ubuntu 26.04** so `glslc` matches CI (24.04 shaderc is too
-old for dp4a shaders). Runtime Vulkan image installs `mesa-vulkan-drivers`,
-`libvulkan1`, GLVND bits, and `vulkan-tools`.
+Full user-facing walkthrough (prerequisites, exact commands, troubleshooting,
+release packaging): **[`../RELEASE.md`](../RELEASE.md)**.
 
-SYCL scaffold base: `intel/deep-learning-essentials:*-ubuntu24.04` — mirrors
-the llama.cpp Intel Docker pattern for when a Backend exists.
+CPU/Vulkan build stage pins **Ubuntu 26.04** so `glslc` matches CI (24.04
+shaderc is too old for dp4a shaders). Runtime Vulkan image installs
+`mesa-vulkan-drivers`, `libvulkan1`, GLVND bits, and `vulkan-tools`.
+
+SYCL image base: `intel/deep-learning-essentials:2025.3.3-0-devel-ubuntu24.04`
+(`BASE_IMAGE` build-arg; a newer `2026.1.2-devel-ubuntu24.04` tag is confirmed
+pullable but not yet hardware-validated) — the llama.cpp Intel Docker pattern.
+Since that base is Ubuntu 24.04, `Dockerfile.sycl` copies a modern `glslc` in
+from an Ubuntu 26.04 stage rather than switching bases (infr-vulkan stays a
+build-time dependency for shader compilation even in the SYCL image). Level
+Zero is pinned to **1.28.2** via upstream `.deb`s from
+`github.com/oneapi-src/level-zero/releases`, installed over whatever the base
+image's own PPA snapshot ships, in both the build and runtime stages.
 
 ---
 
@@ -198,10 +230,14 @@ the llama.cpp Intel Docker pattern for when a Backend exists.
 
 1. **When to flip `coopmat_8x8` default on Arc** — after A770/B580 benches +
    parity, not before.
-2. **Phase 2 trigger** — only if Vulkan leaves a clear, reproducible gap vs
-   llama.cpp-SYCL on the *same* card and model set.
+2. **`Op::Linear` → oneDNN wiring** — `SyclBackend::gemm_f32` is implemented
+   and tested (`crates/infr-sycl/tests/gemm.rs`) but not yet called from the
+   compute graph interpreter; needs either a CPU-interpreter override hook or
+   a thin `infr-sycl`-side `Op::Linear` layer. This is what would let SYCL
+   compete with Vulkan on throughput, not just correctness.
 3. **CI** — optional `workflow_dispatch` Docker build (no GPU runner assumed);
-   ignored Vulkan tests stay local/hardware-gated.
+   ignored Vulkan tests stay local/hardware-gated. No CI currently builds
+   `--features sycl` (needs the Intel oneAPI toolchain, not just `glslc`).
 4. **TileLang** — revisit only if upstream ships SPIR-V/Intel codegen; do not
    block Arc Docker or SYCL planning on it.
 
@@ -210,6 +246,7 @@ the llama.cpp Intel Docker pattern for when a Backend exists.
 ## 7. References
 
 - Root overview: [`README.md`](../README.md)
+- **Release try guide (copy-paste, all three images): [`../RELEASE.md`](../RELEASE.md)**
 - iGPU campaign: [`igpu.md`](igpu.md)
 - Intel Vulkan perf notes: [`perf/vulkan-review.md`](perf/vulkan-review.md)
 - Config / `INFR_CM_8X8`: [`config.md`](config.md)

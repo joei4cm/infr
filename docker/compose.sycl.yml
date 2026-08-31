@@ -1,0 +1,46 @@
+# Compose helper for the SYCL / oneAPI image (Intel Arc native, Level Zero).
+#
+# Host prerequisites:
+#   - /dev/dri render nodes (e.g. renderD128) — Level Zero needs the DRM render
+#     node the same way Vulkan does.
+#   - Your user in the `render` (and often `video`) group, OR pass the render
+#     GID explicitly via group_add below.
+#
+# Discover the render GID on the host:
+#   stat -c '%g' /dev/dri/renderD128
+# Then either uncomment group_add with that numeric GID, or rely on the
+# container user already matching (root in this image can often open DRI, but
+# group_add is the reliable path for non-root later).
+#
+# Usage:
+#   docker compose -f docker/compose.sycl.yml run --rm infr devices
+#   docker compose -f docker/compose.sycl.yml run --rm infr run MODEL -p "hi"
+#
+# See docker/README.md and RELEASE.md for the full walkthrough (including the
+# CPU/Vulkan alternatives and the `docker/Dockerfile.sycl` build-arg pins).
+
+services:
+  infr:
+    image: infr:sycl-intel
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.sycl
+    devices:
+      - /dev/dri
+    # Uncomment and set to the host render node GID (see header comment):
+    # group_add:
+    #   - "992"
+    environment:
+      INFR_DEV: ${INFR_DEV:-sycl}
+      HF_HOME: /data/huggingface
+      ONEAPI_DEVICE_SELECTOR: ${ONEAPI_DEVICE_SELECTOR:-level_zero:gpu}
+      ZES_ENABLE_SYSMAN: "1"
+      UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
+      # HF_TOKEN: ${HF_TOKEN:-}   # gated repos
+    volumes:
+      # Shared HuggingFace hub cache (same layout as host `~/.cache/huggingface`)
+      - ${HOME}/.cache/huggingface:/data/huggingface
+      - ${INFR_DATA:-.}:/data/work
+    working_dir: /data/work
+    # Default command lists devices; override on the compose CLI.
+    command: ["devices"]

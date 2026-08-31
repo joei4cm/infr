@@ -1012,6 +1012,27 @@ impl SeamModel {
         Ok(stats)
     }
 
+    /// [`Self::bench`]'s SYCL twin (`infr bench --dev sycl`) — same dummy-token timing shape, run
+    /// through [`infr_sycl::SyclBackend`] instead of a bare `CpuBackend` (see that crate's doc for
+    /// what's actually accelerated today: nothing — the numbers here are expected to match
+    /// [`Self::bench`] closely, since both forward to the same CPU interpreter).
+    #[cfg(feature = "sycl")]
+    pub fn bench_sycl(&self, n_prompt: usize, n_gen: usize) -> Result<crate::GenStats> {
+        let prompt: Vec<u32> = (0..n_prompt.max(1)).map(|i| (i % 100) as u32).collect();
+        let (_, stats) = crate::seam::generate_dense_sycl(
+            &self.gguf,
+            &self.cfg,
+            &self.ecfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            &prompt,
+            n_gen,
+            None, // req: bench is a sole sequence — env sampling, no abort latch, no gate
+            |_| {},
+        )?;
+        Ok(stats)
+    }
+
     /// Run the dense decode through the agnostic compute seam on the **Vulkan** backend — the GPU
     /// twin of [`generate_cpu`](Self::generate_cpu). Each native-dtype GGUF weight is padded + uploaded
     /// to VRAM (the CPU path maps it zero-copy instead); the per-token [`infr_core::graph::Graph`] is
@@ -1783,6 +1804,35 @@ impl SeamModel {
         let mut printed = 0usize;
         let (_generated, stats) = crate::seam::generate_dense_cpu_mode(
             infr_cpu::CpuBackend::reference_with(self.ecfg.clone()),
+            &self.gguf,
+            &self.cfg,
+            &self.ecfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            &prompt_tokens,
+            max_new,
+            req,
+            |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
+        )?;
+        Ok(stats)
+    }
+
+    /// Greedy generation on the Intel SYCL/oneAPI backend ([`infr_sycl::SyclBackend`]) — the
+    /// SYCL twin of [`Self::generate_cpu`]. Same forward, same kernels (`SyclBackend` forwards
+    /// every `Backend` method to an owned `CpuBackend` — see that crate's doc), but a real SYCL
+    /// device gets initialized and logged alongside it.
+    #[cfg(feature = "sycl")]
+    pub fn generate_sycl(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
+        mut on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
+        let mut acc: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        let (_generated, stats) = crate::seam::generate_dense_sycl(
             &self.gguf,
             &self.cfg,
             &self.ecfg,

@@ -30,12 +30,11 @@ ref/
 .vscode/
 *.iml
 
-# Host-side helpers (Dockerfiles are read from the host; only the SYCL
-# entrypoint stub needs to be in the build context)
+# Host-side helpers (Dockerfiles are read from the host via `docker build -f`;
+# none of docker/ needs to be inside the build context — every image COPYs
+# only Cargo.toml/Cargo.lock, .cargo, and crates/ from the repo root)
 scripts/
-docker/compose*.yml
-docker/README.md
-docker/Dockerfile.*
+docker/
 
 # Perf archives and local dumps
 **/perf/

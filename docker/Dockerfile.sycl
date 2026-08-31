@@ -1,45 +1,160 @@
-# infr SYCL / oneAPI — Phase-2 SCAFFOLD only.
+# infr SYCL / oneAPI — Intel Arc native backend (Level Zero + oneDNN via icpx/DPC++).
 #
-# This image does NOT run inference. There is no Rust SYCL Backend yet; the
-# entrypoint is a stub that points at docs/intel-gpu.md. When a Backend lands,
-# replace the stub with a real multi-stage build that copies `infr` and wires
-# Level Zero the same way ash wires Vulkan today.
+# This is a REAL inference image, not the Phase-2 scaffold that used to live here
+# (see git history / docker/sycl-entrypoint.sh, now unused — the SYCL Backend
+# implemented behind `--features sycl` is what this Dockerfile builds and runs).
 #
-# Base: Intel deep-learning-essentials (Ubuntu 24.04) — oneAPI / SYCL toolchain
-# plus GPU runtime. Pin can be bumped when the Backend is implemented.
+# Three stages:
+#   glslc      — Ubuntu 26.04, source of a modern `glslc`. infr-vulkan stays a
+#                dependency of the SYCL build (device enumeration / shader
+#                compilation at build time, see crates/infr-vulkan/build.rs),
+#                and DLE's Ubuntu 24.04 ships shaderc 2023.8 — too old for the
+#                dp4a shaders (GL_EXT_integer_dot_product). Ubuntu 26.04 ships
+#                shaderc 2025+, same pin as Dockerfile.cpu / Dockerfile.vulkan.
+#                Verified: the copied binary + its one shared lib run unmodified
+#                against the older glibc/libstdc++ on the Ubuntu 24.04 base.
+#   levelzero  — fetches pinned Level Zero .deb packages once, shared by both
+#                the build and runtime stages below.
+#   build      — Intel deep-learning-essentials (Ubuntu 24.04): icpx, oneDNN,
+#                Level Zero headers/libs, MKL. Builds `infr-cli --features sycl`
+#                and strips the resulting binary.
+#   runtime    — Same DLE base. The base image already ships the Level Zero
+#                compute-runtime ICD for real Arc GPUs (`libze-intel-gpu1`,
+#                `intel-opencl-icd`, `libigc2`) — nothing extra to install
+#                besides re-pinning the Level Zero loader. Just copies the
+#                stripped binary in; larger image than Dockerfile.vulkan, but
+#                zero drift between build and run environments.
+#
+# Pins:
+#   BASE_IMAGE            intel/deep-learning-essentials:2025.3.3-0-devel-ubuntu24.04
+#                         Bump with `--build-arg BASE_IMAGE=...`, e.g.
+#                         intel/deep-learning-essentials:2026.1.2-devel-ubuntu24.04
+#                         (confirmed pullable; not yet validated against real
+#                         hardware — see docs/intel-gpu.md).
+#   LEVEL_ZERO_VERSION    1.28.2 — pinned loader/headers from
+#                         github.com/oneapi-src/level-zero/releases, installed
+#                         over whatever the DLE base currently ships (1.27–1.28.6
+#                         depending on release) so the loader ABI is reproducible
+#                         independent of the base image's own PPA snapshot.
 #
 #   docker build -f docker/Dockerfile.sycl -t infr:sycl-intel .
 #
-# Typical host run flags (same DRM node pattern as the Vulkan image):
-#   --device /dev/dri --group-add $(stat -c '%g' /dev/dri/renderD128)
+# Run (same DRM node pattern as the Vulkan image — Level Zero also needs the
+# render node, not just Vulkan):
+#
+#   RENDER_GID=$(stat -c '%g' /dev/dri/renderD128)
+#   docker run --rm -it \
+#     --device /dev/dri --group-add "$RENDER_GID" \
+#     -v "$HOME/.cache/huggingface:/data/huggingface" \
+#     infr:sycl-intel devices
+#
+# NOTE: this Dockerfile assumes crates/infr-cli's `sycl` feature (implemented on
+# a companion branch) exists and that `cargo build -p infr-cli --features sycl`
+# is a valid invocation. If that Backend has not landed on *this* branch yet,
+# the `build` stage fails at the final `cargo build` step with an
+# unknown-feature error — expected, not a bug in this Dockerfile.
+#
+# Validated against this base image (2026-08-31): glslc portability, pinned
+# Level Zero install, rustup, and icpx/oneDNN auto-detection all succeed.
+# Final link needs Intel runtime libs (`irc`/`imf`/`svml`/`irng`/`intlc`) —
+# `crates/infr-sycl/build.rs` adds them when the compiler is `icpx`.
+# See docs/intel-gpu.md and RELEASE.md.
 
-FROM intel/deep-learning-essentials:2025.3.3-0-devel-ubuntu24.04
+ARG BASE_IMAGE=intel/deep-learning-essentials:2025.3.3-0-devel-ubuntu24.04
 
-LABEL org.opencontainers.image.title="infr (SYCL / Intel — scaffold)" \
-      org.opencontainers.image.description="Phase-2 scaffold for a future infr Intel SYCL/oneAPI Backend — does not run inference" \
+# ── glslc source ─────────────────────────────────────────────────────────────
+FROM ubuntu:26.04 AS glslc
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends glslc \
+ && rm -rf /var/lib/apt/lists/*
+
+# ── Level Zero .deb source (shared by build + runtime) ──────────────────────
+FROM ${BASE_IMAGE} AS levelzero
+ARG LEVEL_ZERO_VERSION=1.28.2
+ARG LEVEL_ZERO_UBUNTU_TAG=u24.04
+WORKDIR /debs
+RUN wget -q \
+      "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/level-zero_${LEVEL_ZERO_VERSION}+${LEVEL_ZERO_UBUNTU_TAG}_amd64.deb" \
+      "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/level-zero-devel_${LEVEL_ZERO_VERSION}+${LEVEL_ZERO_UBUNTU_TAG}_amd64.deb" \
+ && ls -la /debs
+
+# ── build ────────────────────────────────────────────────────────────────────
+FROM ${BASE_IMAGE} AS build
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CARGO_TERM_COLOR=always \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+# oneAPI's own PATH / LD_LIBRARY_PATH / CPATH / DNNLROOT / MKLROOT (icpx,
+# oneDNN, MKL, Level Zero headers) are already baked into this base image's
+# Docker ENV — no `setvars.sh` to source, it carries into every RUN below.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        build-essential \
+        pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+
+# glslc + its one shared lib, copied from the Ubuntu 26.04 stage above.
+COPY --from=glslc /usr/bin/glslc /usr/local/bin/glslc
+COPY --from=glslc /usr/lib/x86_64-linux-gnu/libshaderc.so.1 /usr/local/lib/
+RUN ldconfig && glslc --version
+
+# Pin Level Zero (loader + headers) instead of trusting the base image's PPA.
+# `--purge --force-depends` drops the base's own libze1/libze-dev first (same
+# soname/header paths, dpkg refuses a plain overwrite otherwise); the actual
+# GPU runtime package (libze-intel-gpu1) keeps working unmodified since the
+# loader's soname (libze_loader.so.1) is unchanged, only its dpkg dependency
+# record goes stale — harmless in a container that never runs apt again.
+COPY --from=levelzero /debs/*.deb /tmp/
+RUN dpkg --purge --force-depends libze1 libze-dev 2>/dev/null || true \
+ && dpkg -i /tmp/level-zero_*.deb /tmp/level-zero-devel_*.deb \
+ && rm -f /tmp/*.deb
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal \
+ && rustc --version && cargo --version && icpx --version
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo .cargo
+COPY crates crates
+
+RUN cargo build --release -p infr-cli --locked --features sycl \
+ && strip --strip-debug target/release/infr || strip target/release/infr \
+ && test -x target/release/infr \
+ && ./target/release/infr --help | head -5
+
+# ── runtime ──────────────────────────────────────────────────────────────────
+FROM ${BASE_IMAGE} AS runtime
+
+LABEL org.opencontainers.image.title="infr (SYCL / Intel oneAPI)" \
+      org.opencontainers.image.description="Pure-Rust LLM inference engine — SYCL/Level Zero backend (Intel Arc native)" \
       org.opencontainers.image.source="https://github.com/kryptic-sh/infr" \
       org.opencontainers.image.url="https://github.com/kryptic-sh/infr" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="0.0.0"
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    HF_HOME=/data/huggingface
+# Re-pin the Level Zero runtime loader the same way the build stage does — the
+# base image's own PPA snapshot can drift between DLE releases.
+COPY --from=levelzero /debs/level-zero_*.deb /tmp/
+RUN dpkg --purge --force-depends libze1 libze-dev 2>/dev/null || true \
+ && dpkg -i /tmp/level-zero_*.deb \
+ && rm -f /tmp/*.deb \
+ && ldconfig
 
-# Level Zero / compute-runtime as available from apt on this base. The Intel
-# image already ships much of this; install whatever the archive provides so a
-# future Backend can link against Level Zero without rewriting the Dockerfile.
-RUN apt-get update \
- && (apt-get install -y --no-install-recommends \
-        ca-certificates \
-        level-zero \
-        level-zero-dev \
-     || apt-get install -y --no-install-recommends ca-certificates) \
- && rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive \
+    HF_HOME=/data/huggingface \
+    PATH=/usr/local/bin:$PATH \
+    INFR_DEV=sycl \
+    ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
+    ZES_ENABLE_SYSMAN=1 \
+    UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
+
+COPY --from=build /src/target/release/infr /usr/local/bin/infr
 
 WORKDIR /data
-
-COPY docker/sycl-entrypoint.sh /usr/local/bin/infr-sycl-stub
-RUN chmod +x /usr/local/bin/infr-sycl-stub
-
-# Stub only — do not claim this runs infr inference.
-ENTRYPOINT ["/usr/local/bin/infr-sycl-stub"]
+ENTRYPOINT ["infr"]

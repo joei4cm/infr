@@ -85,6 +85,11 @@ enum Backend {
     Metal,
     /// The CPU reference backend (`device.dev = "cpu"` / `INFR_DEV=cpu`).
     Cpu,
+    /// The Intel SYCL/oneAPI backend (`device.dev = "sycl"` / `INFR_DEV=sycl`) — see
+    /// `crates/infr-sycl`. Parses unconditionally (this variant always exists); actually
+    /// CONSTRUCTING it requires the crate to have been built with `--features sycl`, checked by
+    /// [`require_sycl_feature`] at every entry point that would build one.
+    Sycl,
 }
 
 /// The INHERITED half of the device decision, so the backend DECISION
@@ -113,9 +118,15 @@ impl BackendEnv {
 }
 
 /// Parse a device spec (from `--dev` OR `INFR_DEV`) — the ONE grammar: a Vulkan GPU
-/// (`Vulkan0`/`Vulkan1`/…), `metal`, or `cpu`, case-insensitive. The original casing is preserved
-/// for the Vulkan spec (the deep reader re-parses it). Errors carry only the "expected forms" tail;
-/// the caller wraps it with which source (`--dev` vs `INFR_DEV`) was bad.
+/// (`Vulkan0`/`Vulkan1`/…), `metal`, `cpu`, or `sycl`, case-insensitive. The original casing is
+/// preserved for the Vulkan spec (the deep reader re-parses it). Errors carry only the "expected
+/// forms" tail; the caller wraps it with which source (`--dev` vs `INFR_DEV`) was bad.
+///
+/// `sycl` parses successfully EVEN IN A BUILD WITHOUT THE `sycl` FEATURE — the crate wasn't
+/// necessarily built with the Intel oneAPI toolchain when this config/env value was written, and
+/// a config-file/env typo deserves the SAME grammar error every other bad `--dev` gets, not a
+/// confusing one about a cargo feature. [`require_sycl_feature`] is the actual runtime gate, run
+/// at every entry point that would construct a [`Backend::Sycl`].
 fn parse_dev_spec(d: &str) -> anyhow::Result<Backend> {
     let lower = d.trim().to_ascii_lowercase();
     if lower.starts_with("vulkan") {
@@ -124,8 +135,27 @@ fn parse_dev_spec(d: &str) -> anyhow::Result<Backend> {
         Ok(Backend::Metal)
     } else if lower == "cpu" {
         Ok(Backend::Cpu)
+    } else if lower == "sycl" {
+        Ok(Backend::Sycl)
     } else {
-        anyhow::bail!("expected a Vulkan GPU like `Vulkan0`/`Vulkan1`, `metal`, or `cpu`");
+        anyhow::bail!("expected a Vulkan GPU like `Vulkan0`/`Vulkan1`, `metal`, `cpu`, or `sycl`");
+    }
+}
+
+/// [`Backend::Sycl`] requires the crate to have been rebuilt with `--features sycl` (which pulls
+/// in `infr-sycl`, and with it the Intel oneAPI/SYCL toolchain requirement at BUILD time — see
+/// that crate's doc). Call this at every entry point that would actually construct the backend
+/// (never at `parse_dev_spec`/`resolve_backend` — those must keep parsing `sycl` cleanly so a
+/// config file or `INFR_DEV=sycl` gets THIS clear error instead of a confusing grammar one).
+fn require_sycl_feature() -> anyhow::Result<()> {
+    if cfg!(feature = "sycl") {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "the SYCL backend (--dev sycl / INFR_DEV=sycl) requires rebuilding infr with \
+             `--features sycl` (needs a C++ toolchain — ideally the Intel oneAPI DPC++ compiler \
+             `icpx` plus oneDNN — at build time; see crates/infr-sycl)"
+        );
     }
 }
 
@@ -169,6 +199,7 @@ fn dev_spec_of(backend: &Backend) -> String {
 
         Backend::Metal => "metal".to_string(),
         Backend::Cpu => "cpu".to_string(),
+        Backend::Sycl => "sycl".to_string(),
     }
 }
 
@@ -189,8 +220,9 @@ fn nan_safe_ratio_cmp(a: f64, b: f64) -> std::cmp::Ordering {
 /// `run`/`serve` (they only honoured `INFR_METAL`/`INFR_CPU` before).
 #[derive(clap::Args)]
 struct DeviceOpts {
-    /// Device for the forward: a Vulkan GPU (`Vulkan0`/`Vulkan1`/…), `metal` (Apple GPU), or `cpu`
-    /// (reference backend). Case-insensitive; matches llama.cpp's --dev. Unset = the first discrete
+    /// Device for the forward: a Vulkan GPU (`Vulkan0`/`Vulkan1`/…), `metal` (Apple GPU), `cpu`
+    /// (reference backend), or `sycl` (Intel GPU via oneAPI/SYCL — requires a build with
+    /// `--features sycl`). Case-insensitive; matches llama.cpp's --dev. Unset = the first discrete
     /// Vulkan GPU, else device 0.
     #[arg(long)]
     dev: Option<String>,
@@ -1054,22 +1086,28 @@ fn build_chat_model(
     cfg: &Arc<Config>,
 ) -> anyhow::Result<Box<dyn infr_llama::chat::ChatModel + Send>> {
     let backend = selected_backend(cfg)?;
+    if matches!(backend, Backend::Sycl) {
+        require_sycl_feature()?;
+    }
     if is_dg {
         // diffusion-gemma (Phase 3/D, docs/diffusion-gemma.md): the entropy-bound block-diffusion
         // loop over a persistent session — Vulkan by default, CPU under INFR_DEV=cpu, Metal under
         // INFR_DEV=metal (the non-macOS build still compiles the Metal arm; `DiffusionGemmaChat::generate`
-        // errors clearly at runtime there).
+        // errors clearly at runtime there). SYCL has no dedicated DG path yet (the backend's own MVP
+        // is dense-only — see `crates/infr-sycl`'s doc), so `INFR_DEV=sycl` on a diffusion-gemma
+        // GGUF runs DG on the CPU reference path, same as `INFR_DEV=cpu`.
         tracing::info!(
             "[{} — diffusion-gemma entropy-bound block decode]",
             match backend {
                 Backend::Cpu => "cpu backend",
                 Backend::Metal => "metal backend",
+                Backend::Sycl => "cpu backend (SYCL has no diffusion-gemma path yet)",
                 Backend::Vulkan(_) => "vulkan seam",
             }
         );
         let loaded = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
         return Ok(match backend {
-            Backend::Cpu => Box::new(infr_llama::chat::DiffusionGemmaChat::new_cpu(loaded)),
+            Backend::Cpu | Backend::Sycl => Box::new(infr_llama::chat::DiffusionGemmaChat::new_cpu(loaded)),
             Backend::Metal => Box::new(infr_llama::chat::DiffusionGemmaChat::new_metal(loaded)),
             Backend::Vulkan(_) => Box::new(infr_llama::chat::DiffusionGemmaChat::new(loaded)),
         });
@@ -1097,6 +1135,24 @@ fn build_chat_model(
             Ok(Box::new(infr_llama::chat::CpuDenseChat::new(
                 infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?,
             )))
+        }
+        // Intel SYCL/oneAPI (`require_sycl_feature` already checked above): dense/MoE on the
+        // agnostic compute graph via `SyclBackend`, which forwards every kernel to the CPU
+        // reference interpreter while initializing a real SYCL device (see `crates/infr-sycl`).
+        Backend::Sycl => {
+            #[cfg(feature = "sycl")]
+            {
+                tracing::info!(
+                    "[sycl backend — dense/MoE forward on Intel GPU/CPU via oneAPI SYCL, agnostic compute graph]"
+                );
+                Ok(Box::new(infr_llama::chat::SyclDenseChat::new(
+                    infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?,
+                )))
+            }
+            #[cfg(not(feature = "sycl"))]
+            {
+                unreachable!("require_sycl_feature already returned an error above")
+            }
         }
         // The default: dense/MoE on the VULKAN agnostic seam — persistent multi-slot KV sessions
         // (per-turn suffix-only prefill), record-once decode replay, MoE expert auto-fit. qwen35
@@ -1159,7 +1215,7 @@ fn cmd_run(
             );
         };
         if is_dg || !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
-            anyhow::bail!("INFR_PIPELINE is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / diffusion-gemma");
+            anyhow::bail!("INFR_PIPELINE is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / INFR_DEV=sycl / diffusion-gemma");
         }
         let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
@@ -1183,7 +1239,7 @@ fn cmd_run(
             );
         };
         if is_dg || !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
-            anyhow::bail!("INFR_TENSOR_PARALLEL is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / diffusion-gemma");
+            anyhow::bail!("INFR_TENSOR_PARALLEL is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / INFR_DEV=sycl / diffusion-gemma");
         }
         let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
@@ -1208,7 +1264,7 @@ fn cmd_run(
             );
         };
         if is_dg || !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
-            anyhow::bail!("INFR_EXPERT_PARALLEL is a Vulkan MoE path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / diffusion-gemma");
+            anyhow::bail!("INFR_EXPERT_PARALLEL is a Vulkan MoE path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / INFR_DEV=sycl / diffusion-gemma");
         }
         let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
@@ -2100,12 +2156,16 @@ fn cmd_bench(
     } else {
         selected_backend(cfg)?
     };
+    if matches!(backend, Backend::Sycl) {
+        require_sycl_feature()?;
+    }
     // diffusion-gemma (Phase 4/D, docs/diffusion-gemma.md): llama-bench has no diffusion mode, so
     // `infr bench` measures infr's OWN decode shape (block prefill + canvas denoise, see
-    // `cmd_bench_diffusion_gemma`'s doc) instead of routing through the AR pp/tg arms below.
+    // `cmd_bench_diffusion_gemma`'s doc) instead of routing through the AR pp/tg arms below. SYCL
+    // has no DG path yet (see `build_chat_model`'s doc) — it rides the CPU arm here too.
     if infr_llama::diffusion::is_diffusion_gemma(&gguf) {
         let metal = matches!(backend, Backend::Metal);
-        let cpu = matches!(backend, Backend::Cpu);
+        let cpu = matches!(backend, Backend::Cpu | Backend::Sycl);
         return cmd_bench_diffusion_gemma(
             &gguf,
             tok.as_deref(),
@@ -2139,6 +2199,28 @@ fn cmd_bench(
             json,
             cfg,
         );
+    }
+    // SYCL (`--dev sycl` / `INFR_DEV=sycl`, `require_sycl_feature` already checked above): the
+    // same pp/tg/pg + depth methodology as the CPU arm, through `SyclBackend` instead.
+    if matches!(backend, Backend::Sycl) {
+        #[cfg(feature = "sycl")]
+        {
+            return cmd_bench_sycl(
+                &gguf,
+                tok.as_deref(),
+                n_prompt,
+                n_gen,
+                depth,
+                pg,
+                reps,
+                json,
+                cfg,
+            );
+        }
+        #[cfg(not(feature = "sycl"))]
+        {
+            unreachable!("require_sycl_feature already returned an error above")
+        }
     }
     // Metal (set by `--dev metal` or `INFR_DEV=metal`): bench the dense forward on the Metal backend
     // through the agnostic seam — same pp/tg/pg + depth methodology as the CPU arm, directly
@@ -2617,6 +2699,54 @@ fn cmd_bench_cpu(
     // before REPORTING rather than before running, so the whole timed window is covered.
     watch.check()?;
     print_bench_avg(&samples, &label, depth, " [cpu]", reps, json, None);
+    Ok(())
+}
+
+/// [`cmd_bench_cpu`]'s SYCL twin (`infr bench --dev sycl`) — identical pp/tg/pg methodology,
+/// through [`infr_llama::SeamModel::bench_sycl`] instead of [`infr_llama::SeamModel::bench`].
+#[cfg(feature = "sycl")]
+#[allow(clippy::too_many_arguments)]
+fn cmd_bench_sycl(
+    gguf: &Path,
+    tok: Option<&Path>,
+    n_prompt: usize,
+    n_gen: usize,
+    depth: usize,
+    pg: Option<(usize, usize)>,
+    reps: usize,
+    json: bool,
+    cfg: &Arc<Config>,
+) -> anyhow::Result<()> {
+    let watch = infr_llama::WeightWatch::open(gguf)?;
+    let model = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
+    let measure_tg = pg.is_none() && n_gen > 0;
+    // One untimed warmup to build runtime caches (and the SYCL device init log) before the timed reps.
+    let _ = model.bench_sycl(depth.max(1), if measure_tg || pg.is_some() { 1 } else { 0 });
+    let mut samples = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let ts = if let Some((p, g)) = pg {
+            let s = model.bench_sycl(p, g)?; // pg: prefill p + decode g, throughput (p+g)/total
+            (p + g) as f64 / (s.prompt_secs + s.decode_secs)
+        } else if measure_tg {
+            let s = model.bench_sycl(depth.max(1), n_gen)?; // tg@depth: decode at `depth` context
+            n_gen as f64 / s.decode_secs
+        } else {
+            let s = model.bench_sycl(n_prompt, 0)?; // pp: prefill only
+            n_prompt as f64 / s.prompt_secs
+        };
+        samples.push(ts);
+    }
+    let label = if let Some((p, g)) = pg {
+        format!("pg{p}+{g}")
+    } else if measure_tg {
+        format!("tg{n_gen}")
+    } else {
+        format!("pp{n_prompt}")
+    };
+    // Numbers measured against a mapping whose file moved under it are not numbers. Checked
+    // before REPORTING rather than before running, so the whole timed window is covered.
+    watch.check()?;
+    print_bench_avg(&samples, &label, depth, " [sycl]", reps, json, None);
     Ok(())
 }
 
@@ -4096,8 +4226,8 @@ fn cmd_multi(
     // than silently ignoring them.
     if !matches!(selected_backend(cfg)?, Backend::Vulkan(_)) {
         anyhow::bail!(
-            "`infr multi` hosts models on the Vulkan device pool; drop INFR_DEV=cpu/INFR_DEV=metal \
-             (the CPU/Metal reference backends have no multi-slot engine)"
+            "`infr multi` hosts models on the Vulkan device pool; drop INFR_DEV=cpu/INFR_DEV=metal/INFR_DEV=sycl \
+             (the CPU/Metal/SYCL reference backends have no multi-slot engine)"
         );
     }
 
@@ -4362,6 +4492,17 @@ mod tests {
             resolve_backend(None, env(Some("metal"))).unwrap(),
             Backend::Metal
         );
+        // `sycl` parses to `Backend::Sycl` REGARDLESS of whether this binary was built with the
+        // `sycl` cargo feature — see `parse_dev_spec`'s doc; `require_sycl_feature` is the
+        // separate runtime gate.
+        assert_eq!(
+            resolve_backend(None, env(Some("sycl"))).unwrap(),
+            Backend::Sycl
+        );
+        assert_eq!(
+            resolve_backend(Some("SyCl"), BackendEnv::default()).unwrap(),
+            Backend::Sycl
+        );
         // Garbage INFR_DEV errors early with a clear message (typo protection).
         let e = resolve_backend(None, env(Some("foo"))).unwrap_err();
         let msg = format!("{e:#}");
@@ -4372,6 +4513,19 @@ mod tests {
             resolve_backend(None, BackendEnv::default()).unwrap(),
             Backend::Vulkan(None)
         );
+    }
+
+    #[test]
+    fn require_sycl_feature_matches_the_cargo_feature() {
+        // This binary's own build determines the outcome — the test just pins the CONTRACT: the
+        // check errors iff the crate was built without `--features sycl`, and the error names the
+        // fix rather than failing silently or with a confusing message.
+        let result = require_sycl_feature();
+        assert_eq!(result.is_ok(), cfg!(feature = "sycl"));
+        if let Err(e) = result {
+            let msg = format!("{e:#}");
+            assert!(msg.contains("--features sycl"), "message names the fix: {msg}");
+        }
     }
 
     #[test]

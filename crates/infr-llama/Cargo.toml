@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Off by default — see `crates/infr-sycl`'s doc. Turns on the optional `infr-sycl` dependency
+# (its own `sycl` feature too, so its C++ shim actually gets built — see that crate's
+# `#![cfg(feature = "sycl")]`) and the `generate_dense_sycl`/`SyclDenseChat` wiring below
+# (`seam/mod.rs`, `chat/sycl.rs`). Requires a C++ toolchain at build time (ideally `icpx` — see
+# `infr-sycl/build.rs`); without it the shim still links via a host CPU fallback.
+sycl = ["dep:infr-sycl", "infr-sycl/sycl"]
+
 [dependencies]
 infr-prof.workspace = true
 infr-prof-rt.workspace = true
@@ -12,6 +20,7 @@ infr-core.workspace = true
 infr-chat.workspace = true
 infr-vulkan.workspace = true
 infr-metal.workspace = true
+infr-sycl = { workspace = true, optional = true }
 infr-gguf.workspace = true
 infr-cpu.workspace = true
 serde_json.workspace = true

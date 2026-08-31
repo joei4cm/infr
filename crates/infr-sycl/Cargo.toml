@@ -1,0 +1,21 @@
+[package]
+name = "infr-sycl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Off by default — see `src/lib.rs`'s `#![cfg(feature = "sycl")]` doc. `infr-llama`/`infr-cli`
+# pull this crate in as an OPTIONAL dependency gated behind their own `sycl` feature, which also
+# forwards into this one (`infr-sycl/sycl`), so a default workspace build never compiles a line
+# of C++ and never needs the Intel oneAPI toolchain. See `build.rs` for what turns on with it.
+sycl = []
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+infr-core.workspace = true
+infr-cpu.workspace = true
+tracing.workspace = true
