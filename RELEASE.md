@@ -352,7 +352,7 @@ together; §3 Option B is the corresponding load-and-verify recipe.
 | ---- | ---- | ------ |
 | `infr-cpu-0.1.0.tar.gz` | 57 MB | `2fb468e06ce23b67ca866b2c47652b56d371a52085fbb4ddada7d631274a9450` |
 | `infr-vulkan-0.1.0.tar.gz` | 149 MB | `e56389a3e6c9cc736122f7df2b87a943f0cb78cc4e0a39419805c39c8b966fa9` |
-| `infr-sycl-intel-0.1.0.tar.gz` | 2.9 GB | `06996010cd68c0299f24d325fca0d8c251d40a4ca8da4c21e86a399fc234b186` |
+| `infr-sycl-intel-0.1.0.tar.gz` | 2.9 GB | `06996010cd68c0299f24d325fca0d8c259d40a4ca8da4c21e86a399fc234b186` |
 
 The SYCL image is large because it embeds the Intel
 `deep-learning-essentials` oneAPI runtime. Prefer `infr:vulkan` for everyday
