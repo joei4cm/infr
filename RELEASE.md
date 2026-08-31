@@ -79,15 +79,19 @@ multi-GB `intel/deep-learning-essentials` base image the first time.
 ### Option B — Load from a release tarball
 
 If you received `dist/*.tar.gz` files (produced by
-`scripts/docker-release.sh`, see §10) instead of a git checkout:
+`scripts/docker-release.sh`, see §10) or downloaded them from the GitHub
+Release page instead of a git checkout:
 
 ```bash
+# CPU + Vulkan (single files):
 gunzip -c infr-cpu-0.1.0.tar.gz        | docker load
 gunzip -c infr-vulkan-0.1.0.tar.gz     | docker load
+
+# SYCL is split into two parts (GitHub Release asset limit is 2 GiB):
+cat infr-sycl-intel-0.1.0.tar.gz.part-* > infr-sycl-intel-0.1.0.tar.gz
 gunzip -c infr-sycl-intel-0.1.0.tar.gz | docker load
 
-# Verify the download wasn't corrupted (compare against the SHA256SUMS
-# file that ships alongside the tarballs):
+# Verify (compare against the SHA256SUMS file that ships alongside):
 sha256sum -c SHA256SUMS
 ```
 
@@ -353,6 +357,12 @@ together; §3 Option B is the corresponding load-and-verify recipe.
 | `infr-cpu-0.1.0.tar.gz` | 57 MB | `2fb468e06ce23b67ca866b2c47652b56d371a52085fbb4ddada7d631274a9450` |
 | `infr-vulkan-0.1.0.tar.gz` | 149 MB | `e56389a3e6c9cc736122f7df2b87a943f0cb78cc4e0a39419805c39c8b966fa9` |
 | `infr-sycl-intel-0.1.0.tar.gz` | 2.9 GB | `06996010cd68c0299f24d325fca0d8c259d40a4ca8da4c21e86a399fc234b186` |
+| `infr-sycl-intel-0.1.0.tar.gz.part-0` | 1.5 GB | `1dc15633a1a7ced3ae1785930d7dedc8268913288966b0ac55465cfa57d1b843` |
+| `infr-sycl-intel-0.1.0.tar.gz.part-1` | 1.4 GB | `caba3ab35ad64cfa2d395c29ba4c96a068119fc45c7b5c417764228266422cb6` |
+
+GitHub Release assets ship the SYCL image as **two parts** (2 GiB upload
+limit). Reassemble with `cat …part-* > infr-sycl-intel-0.1.0.tar.gz` before
+`docker load` (see §3 Option B).
 
 The SYCL image is large because it embeds the Intel
 `deep-learning-essentials` oneAPI runtime. Prefer `infr:vulkan` for everyday
